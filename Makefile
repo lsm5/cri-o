@@ -90,7 +90,28 @@ crioctl: .gopathok $(shell hack/find-godeps.sh $(GOPKGDIR) cmd/crioctl $(PROJECT
 crio.conf: crio
 	./bin/crio --config="" config --default > crio.conf
 
-clean:
+tarball-prep:
+	git archive --format=tar.gz --prefix=cri-o-testonly/ HEAD > ../cri-o-testonly_1.8.0.orig.tar.gz
+
+test-rpm: tarball-prep
+	sudo yum-builddep -y cri-o-testonly.spec
+	rpmbuild --define "_sourcedir `pwd`/.." --define "_specdir `pwd`" \
+		--define "_rpmdir `pwd`" --define "_srcrpmdir `pwd`" -ba cri-o-testonly.spec
+
+test-deb: tarball-prep
+	sudo apt-add-repository -y ppa:projectatomic/ppa
+	sudo sed -i '/deb-src/s/# //g' /etc/apt/sources.list.d/projectatomic-ubuntu-ppa-zesty.list
+	sudo apt update
+	sudo apt build-dep cri-o
+	dpkg-buildpackage -us -uc
+
+clean-rpm:
+	rm -rf cri-o*.src.rpm cri-o-testonly.tar.gz ${shell uname -m}
+
+clean-deb:
+	rm -rf debian/cri-o ../*ppa*
+
+clean: clean-rpm clean-deb
 ifneq ($(GOPATH),)
 	rm -f "$(GOPATH)/.gopathok"
 endif
