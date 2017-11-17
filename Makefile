@@ -94,16 +94,16 @@ tarball-prep:
 	git archive --format=tar.gz --prefix=cri-o-testonly/ HEAD > ../cri-o-testonly_1.8.0.orig.tar.gz
 
 test-rpm: tarball-prep
-	if [ -r "$(CURDIR)/*.spec" ]; then
-		# Note: Assumes $(CURDIR) is a git repository clone
-		sudo ./contrib/rpm/make-testonly-rpms           \
-            ../cri-o-testonly_1.8.0.orig.tar.gz        \
-			$(CURDIR)
-	else
+	SPECS=$(shell ls *.spec);	\
+	if [ -n "$(SPECS)" ]; then \
 		sudo ./contrib/rpm/make-testonly-rpms			\
-			../cri-o-testonly_1.8.0.orig.tar.gz		\
-			https://src.fedoraproject.org/rpms/cri-o.git	\
-			pull/1/head
+			 ../cri-o-testonly_1.8.0.orig.tar.gz		\
+			 $(CURDIR); \
+	else \
+		sudo ./contrib/rpm/make-testonly-rpms			\
+			../cri-o-testonly_1.8.0.orig.tar.gz			\
+			https://src.fedoraproject.org/rpms/cri-o.git\
+			pull/1/head; \
 	fi
 
 test-deb: tarball-prep
