@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# make-testonly-rpms - build cri-o testing rpms
+#
+# Invocation: run this while cd'ed to a checked-out copy of cri-o from git.
+#
+ME=$(basename $0)
+
+# boilerplate: command-line option and arg processing
+missing=" argument is missing; see $ME --help for details"
+usage="Usage: $ME [--help] TARBALL_PATH GIT_REPO_URL [GIT_BRANCH]
+
+--help          display usage message
+
+$ME builds installable cri-o RPMs
+
+    TARBALL_PATH is a path (relative is OK) to a tarball containing
+                 cri-o sources. It should unpack into a subdirectory
+                 named 'cri-o-testonly'.
+
+    GIT_REPO_URL is a URL to a git repo containing an RPM spec file
+                 and all other files (e.g. patches) needed to build
+                 and package cri-o.
+
+    GIT_BRANCH   (optional; default: master) is a branch to use.
+                 This allows easy testing of PRs on the specfile repo.
+"
+
+for i
+do
+    value=`expr "$i" : '[^=]*=\(.*\)'`
+    case "$i" in
+    -h*|--help) echo "$usage"; exit 0;;
+    -*) echo "$ME: unrecognized option $i" >&2
+        echo "$usage" >&2
+        exit 1;;
+    *)  break;;
+    esac
+done
+
+# First arg: path to tarball. Get its full path now, before we cd out.
+TARBALL_PATH=${1?TARBALL_PATH$missing}
+full_tarball_path=$(realpath $TARBALL_PATH)
+
+# fedpkg/rhpkg repo containing specfile, patches, what's needed for build
+# e.g. https://src.fedoraproject.org/rpms/cri-o.git
+GIT_REPO_URL=${2?GIT_REPO_URL$missing}
+
+# If present, final arg is a git branch
+GIT_BRANCH=${3-master}
+
+# Done with boilerplate. Start working.
+set -e
+
+orig_dir=$(realpath .)
+
+# Pull the RPM-building components
+workdir=$(mktemp --tmpdir -d $ME.XXXXXXX)
+cd $workdir
+
+git clone $GIT_REPO_URL myspec
+cd myspec
+git fetch origin $GIT_BRANCH:mybranch
+git checkout mybranch
+
+# "testonl" (no "y") because this is a pretend git hash; specfile uses abbrev.
+cp $full_tarball_path ./cri-o-testonl.tar.gz
+
+# Grab the other source tarball (cri-tools). Adding %dump to a specfile
+# causes it to list all defined macros; this gives us a full URL to source1
+SPEC=$(echo *.spec)
+tmpspec=$(mktemp --suffix=.spec $ME.XXXXXXX)
+
+sed -e '/^%description/ a%dump\nexit 1\n' <$SPEC >$tmpspec
+url=$(rpm -q --specfile $tmpspec 2>&1  |awk '/SOURCEURL1/ { print $3 }'|tail -1)
+rm -f $tmpspec
+wget $url
+
+# Update source0 to point to the tarball we created above
+sed -i -e 's/^\(%global[ ]\+commit0[ ]\+\)[0-9a-f]\+/\1 testonly/' $SPEC
+
+# Build it
+yum-builddep -y $SPEC
+rpmbuild -ba --define "_topdir $(pwd)"         \
+             --define "_sourcedir $(pwd)" $SPEC
+
+# Move rpms back into the directory from which we were invoked
+mv RPMS/*/*.rpm $orig_dir/
+
+# Clean up
+cd /
+rm -rf $workdir

@@ -93,10 +93,14 @@ crio.conf: crio
 tarball-prep:
 	git archive --format=tar.gz --prefix=cri-o-testonly/ HEAD > ../cri-o-testonly_1.8.0.orig.tar.gz
 
+# FIXME! Assumption check: this assumes that 'make test-rpm' is invoked
+#        from the git root. The '../' in tarball-prep above leads me
+#        to wonder if that assumption holds. Please review carefully.
 test-rpm: tarball-prep
-	sudo yum-builddep -y cri-o-testonly.spec
-	rpmbuild --define "_sourcedir `pwd`/.." --define "_specdir `pwd`" \
-		--define "_rpmdir `pwd`" --define "_srcrpmdir `pwd`" -ba cri-o-testonly.spec
+	sudo ./contrib/rpm/make-testonly-rpms			\
+		../cri-o-testonly_1.8.0.orig.tar.gz		\
+		https://src.fedoraproject.org/rpms/cri-o.git	\
+		pull/1/head
 
 test-deb: tarball-prep
 	sudo apt-add-repository -y ppa:projectatomic/ppa
@@ -106,7 +110,7 @@ test-deb: tarball-prep
 	dpkg-buildpackage -us -uc
 
 clean-rpm:
-	rm -rf cri-o*.src.rpm cri-o-testonly.tar.gz ${shell uname -m}
+	rm -rf cri-o*.rpm cri-o-testonly*.tar.gz
 
 clean-deb:
 	rm -rf debian/cri-o ../*ppa*
