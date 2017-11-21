@@ -4,15 +4,15 @@
 #
 # Invocation: run this while cd'ed to a checked-out copy of cri-o from git.
 #
-ME=$(basename $0)
+SCRIPT=$(basename $0)
 
 # boilerplate: command-line option and arg processing
-missing=" argument is missing; see $ME --help for details"
-usage="Usage: $ME [--help] TARBALL_PATH GIT_REPO_URL [GIT_BRANCH]
+missing=" argument is missing; see $SCRIPT --help for details"
+usage="Usage: $SCRIPT [--help] TARBALL_PATH GIT_REPO_URL [GIT_BRANCH]
 
 --help          display usage message
 
-$ME builds installable cri-o RPMs
+$SCRIPT builds installable cri-o RPMs
 
     TARBALL_PATH is a path (relative is OK) to a tarball containing
                  cri-o sources. It should unpack into a subdirectory
@@ -34,7 +34,7 @@ do
     value=`expr "$i" : '[^=]*=\(.*\)'`
     case "$i" in
     -h*|--help) echo "$usage"; exit 0;;
-    -*) echo "$ME: unrecognized option $i" >&2
+    -*) echo "$SCRIPT: unrecognized option $i" >&2
         echo "$usage" >&2
         exit 1;;
     *)  break;;
@@ -58,21 +58,21 @@ set -e
 orig_dir=$(realpath .)
 
 # Pull the RPM-building components
-workdir=$(mktemp --tmpdir -d $ME.XXXXXXX)
+workdir=$(mktemp --tmpdir -d $SCRIPT.XXXXXXX)
 cd $workdir
 
 # The usual case is that we fetch the spec and associated files from
 # a git repo, probably the fedpkg or rhpkg one. But for debugging, if
 # the repo arg is a local directory, just copy it as-is.
 if [[ "$GIT_REPO_URL" =~ ^/ && -d $GIT_REPO_URL ]]; then
-    cp -r $GIT_REPO_URL myspec
-    cd myspec
+    cp -r $GIT_REPO_URL rpm_spec_dir
+    cd rpm_spec_dir
 else
     # The usual case.
-    git clone $GIT_REPO_URL myspec
-    cd myspec
-    git fetch origin $GIT_BRANCH:mybranch
-    git checkout mybranch
+    git clone $GIT_REPO_URL rpm_spec_dir
+    cd rpm_spec_dir
+    git fetch origin $GIT_BRANCH:rpm_spec_branch
+    git checkout rpm_spec_branch
 fi
 
 # "testonl" (no "y") because this is a pretend git hash; specfile uses abbrev.
@@ -81,7 +81,7 @@ cp $full_tarball_path ./cri-o-testonl.tar.gz
 # Grab the other source tarball (cri-tools). Adding %dump to a specfile
 # causes it to list all defined macros; this gives us a full URL to source1
 SPEC=$(echo *.spec)
-tmpspec=$(mktemp --suffix=.spec $ME.XXXXXXX)
+tmpspec=$(mktemp --suffix=.spec $SCRIPT.XXXXXXX)
 
 sed -e '/^%description/ a%dump\nexit 1\n' <$SPEC >$tmpspec
 url=$(rpm -q --specfile $tmpspec 2>&1  |awk '/SOURCEURL1/ { print $3 }'|tail -1)
