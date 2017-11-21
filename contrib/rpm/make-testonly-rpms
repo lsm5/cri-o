@@ -21,6 +21,9 @@ $ME builds installable cri-o RPMs
     GIT_REPO_URL is a URL to a git repo containing an RPM spec file
                  and all other files (e.g. patches) needed to build
                  and package cri-o.
+                 For debugging only: if this argument is an absolute
+                 path (first character is '/') to a local directory,
+                 we use it instead.
 
     GIT_BRANCH   (optional; default: master) is a branch to use.
                  This allows easy testing of PRs on the specfile repo.
@@ -58,10 +61,19 @@ orig_dir=$(realpath .)
 workdir=$(mktemp --tmpdir -d $ME.XXXXXXX)
 cd $workdir
 
-git clone $GIT_REPO_URL myspec
-cd myspec
-git fetch origin $GIT_BRANCH:mybranch
-git checkout mybranch
+# The usual case is that we fetch the spec and associated files from
+# a git repo, probably the fedpkg or rhpkg one. But for debugging, if
+# the repo arg is a local directory, just copy it as-is.
+if [[ "$GIT_REPO_URL" =~ ^/ && -d $GIT_REPO_URL ]]; then
+    cp -r $GIT_REPO_URL myspec
+    cd myspec
+else
+    # The usual case.
+    git clone $GIT_REPO_URL myspec
+    cd myspec
+    git fetch origin $GIT_BRANCH:mybranch
+    git checkout mybranch
+fi
 
 # "testonl" (no "y") because this is a pretend git hash; specfile uses abbrev.
 cp $full_tarball_path ./cri-o-testonl.tar.gz

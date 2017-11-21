@@ -93,18 +93,15 @@ crio.conf: crio
 tarball-prep:
 	git archive --format=tar.gz --prefix=cri-o-testonly/ HEAD > ../cri-o-testonly_1.8.0.orig.tar.gz
 
+# For debugging, REPO_URL can be an absolute path to a local directory:
+#    make test-rpm CRIO_GIT_REPO_URL=/tmp/my-local-crio-fedpkg
+# REPO_BRANCH can be used for testing PRs
+CRIO_GIT_REPO_URL := https://src.fedoraproject.org/rpms/cri-o.git
+CRIO_GIT_REPO_BRANCH :=
 test-rpm: tarball-prep
-	SPECS=$(shell ls *.spec);	\
-	if [ -n "$(SPECS)" ]; then \
-		sudo ./contrib/rpm/make-testonly-rpms			\
-			 ../cri-o-testonly_1.8.0.orig.tar.gz		\
-			 $(CURDIR); \
-	else \
-		sudo ./contrib/rpm/make-testonly-rpms			\
-			../cri-o-testonly_1.8.0.orig.tar.gz			\
-			https://src.fedoraproject.org/rpms/cri-o.git\
-			pull/1/head; \
-	fi
+	sudo ./contrib/rpm/make-testonly-rpms			\
+		../cri-o-testonly_1.8.0.orig.tar.gz		\
+		$(CRIO_GIT_REPO_URL) $(CRIO_GIT_REPO_BRANCH)
 
 test-deb: tarball-prep
 	sudo apt-add-repository -y ppa:projectatomic/ppa
