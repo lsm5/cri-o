@@ -26,7 +26,7 @@ export DH_GOPKG := github.com/kubernetes-incubator/cri-o
 
 BUILDDIR := $(shell pwd)
 GO := /usr/lib/go-1.10/bin/go
-DESTDIR := $(BUILDDIR)/debian/cri-o-1.9
+DESTDIR := $(BUILDDIR)/debian/cri-o-1.10
 BUILDTAGS := 'selinux seccomp $(shell $(BUILDDIR)/hack/btrfs_tag.sh) $(shell $(BUILDDIR)/hack/libdm_tag.sh) containers_image_ostree_stub'
 
 %:

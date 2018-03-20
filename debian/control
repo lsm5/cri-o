@@ -1,4 +1,4 @@
-Source: cri-o-1.9
+Source: cri-o-1.10
 Section: devel
 Priority: optional
 Maintainer: Lokesh Mandvekar <lsm5@fedoraproject.org>
@@ -18,7 +18,7 @@ Homepage: https://github.com/kubernetes-incubator/cri-o
 #Vcs-Git: git://anonscm.debian.org/collab-maint/cri-o.git
 #Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/cri-o.git
 
-Package: cri-o-1.9
+Package: cri-o-1.10
 Architecture: any
 Depends: ${misc:Depends},
     libdevmapper1.02.1,
