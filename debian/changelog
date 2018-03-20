@@ -1,3 +1,9 @@
+cri-o-1.10 (1.10.0-1~ubuntu16.04.2~ppa2) xenial; urgency=medium
+
+  * auto rebuild
+
+ -- Lokesh Mandvekar <lsm5@fedoraproject.org>  Tue, 20 Mar 2018 20:04:26 +0000
+
 cri-o-1.10 (1.10.0-1~ubuntu16.04.2~ppa1) xenial; urgency=medium
 
   * bump to 1.10.0
