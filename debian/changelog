@@ -1,3 +1,9 @@
+cri-o-1.10 (1.10.0-1~ubuntu16.04.2~ppa10) xenial; urgency=medium
+
+  * autobuilt daae2a5
+
+ -- Lokesh Mandvekar <lsm5@fedoraproject.org>  Thu, 22 Mar 2018 11:59:48 +0000
+
 cri-o-1.10 (1.10.0-1~ubuntu16.04.2~ppa9) xenial; urgency=medium
 
   * autobuilt daae2a5
