@@ -17,7 +17,7 @@
 %define gobuild(o:) scl enable go-toolset-1.%{gominver} -- go build -buildmode pie -compiler gc -tags="rpm_crashtraceback no_openssl ${BUILDTAGS:-}" -ldflags "${LDFLAGS:-} -B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -extldflags '%__global_ldflags'" -a -v -x %{?**};
 %else
 %define gobuild(o:) go build -buildmode pie -compiler gc -tags="rpm_crashtraceback no_openssl ${BUILDTAGS:-}" -ldflags "${LDFLAGS:-} -B 0x$(head -c20 /dev/urandom|od -An -tx1|tr -d ' \\n') -extldflags '%__global_ldflags'" -a -v -x %{?**};
-%endif # !centos
+%endif
 
 %global provider github
 %global provider_tld com
@@ -47,7 +47,7 @@ BuildRequires: go-toolset-1.%{gominver}
 %else
 BuildRequires: %{?go_compiler:compiler(go-compiler)}%{!?go_compiler:golang}
 BuildRequires: make
-%endif # !centos
+%endif
 BuildRequires: git
 BuildRequires: glib2-devel
 BuildRequires: glibc-static
@@ -62,7 +62,8 @@ Requires: runc > 1.0.0-57
 Obsoletes: ocid <= 0.3
 Provides: ocid = %{version}-%{release}
 Provides: %{service_name} = %{version}-%{release}
-Requires: containernetworking-plugins >= 0.7.2-1
+Requires: containernetworking-plugins >= 0.7.5-1
+Requires: conmon
 
 %description
 %{summary}
@@ -93,26 +94,21 @@ export BUILDTAGS="selinux seccomp exclude_graphdriver_devicemapper exclude_graph
 # build crio
 export GO111MODULE=off
 %gobuild -o bin/%{service_name} %{import_path}/cmd/%{service_name}
-
-# build conmon
-%gobuild -o bin/config github.com/containers/conmon/cmd/conmon-config
-pushd conmon && ../bin/config
-%{__make} all
-popd
+%gobuild -o bin/%{service_name}-status %{import_path}/cmd/%{service_name}-status
 
 # build pause and docs
-%{__make} GO_MD2MAN=%{_bindir}/go-md2man bin/pause docs
+make GO_MD2MAN=go-md2man bin/pause docs
 
 %install
 ./bin/%{service_name} \
       --selinux \
       --cgroup-manager "systemd" \
       --storage-driver "overlay" \
-      --conmon "%{_libexecdir}/%{service_name}/conmon" \
+      --conmon "%{_bindir}/conmon" \
       --cni-plugin-dir "%{_libexecdir}/cni" \
       --default-mounts "%{_datadir}/rhel/secrets:/run/secrets" \
       --storage-opt "overlay.override_kernel_check=1" \
-      --file-locking=false config > ./%{service_name}.conf
+      config > ./%{service_name}.conf
 
 # install conf files
 install -dp %{buildroot}%{_sysconfdir}/cni/net.d
@@ -155,11 +151,12 @@ export GOPATH=%{buildroot}/%{gopath}:$(pwd)/Godeps/_workspace:%{gopath}
 %license LICENSE
 %doc README.md
 %{_bindir}/%{service_name}
+%{_bindir}/%{service_name}-status
 %{_mandir}/man5/%{service_name}.conf.5*
-%{_mandir}/man8/%{service_name}.8*
+%{_mandir}/man8/%{service_name}*.8*
 %dir %{_sysconfdir}/%{service_name}
 %config(noreplace) %{_sysconfdir}/%{service_name}/%{service_name}.conf
-%config(noreplace) %{_sysconfdir}/%{service_name}/seccomp.json
+#%%config(noreplace) %%{_sysconfdir}/%%{service_name}/seccomp.json
 %config(noreplace) %{_sysconfdir}/sysconfig/%{service_name}
 %config(noreplace) %{_sysconfdir}/sysconfig/%{service_name}-storage
 %config(noreplace) %{_sysconfdir}/sysconfig/%{service_name}-network
@@ -168,7 +165,6 @@ export GOPATH=%{buildroot}/%{gopath}:$(pwd)/Godeps/_workspace:%{gopath}
 %config(noreplace) %{_sysconfdir}/cni/net.d/200-loopback.conf
 %config(noreplace) %{_sysconfdir}/crictl.yaml
 %dir %{_libexecdir}/%{service_name}
-%{_libexecdir}/%{service_name}/conmon
 %{_libexecdir}/%{service_name}/pause
 %{_unitdir}/%{service_name}.service
 %{_unitdir}/%{name}.service
@@ -178,7 +174,8 @@ export GOPATH=%{buildroot}/%{gopath}:$(pwd)/Godeps/_workspace:%{gopath}
 %dir %{_datadir}/oci-umount/oci-umount.d
 %{_datadir}/oci-umount/oci-umount.d/%{service_name}-umount.conf
 %{_unitdir}/%{service_name}-wipe.service
-
+%{_datadir}/bash-completion/completions/%{service_name}-status
+%{_datadir}/fish/completions/%{service_name}-status.fish
 
 %changelog
 * Wed May 08 2019 Lokesh Mandvekar <lsm5@fedoraproject.org> - 1.13-1.ci
