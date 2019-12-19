@@ -1,0 +1,35 @@
+Source: cri-o-1.16
+Section: devel
+Priority: optional
+Maintainer: Lokesh Mandvekar <lsm5@fedoraproject.org>
+Build-Depends: debhelper (>=9),
+    rsync,
+    libgpgme11-dev,
+    libseccomp-dev,
+    golang,
+    libglib2.0-dev,
+    go-md2man,
+    dh-golang,
+    git
+Standards-Version: 4.3.0
+Homepage: https://github.com/cri-o/cri-o
+Vcs-Git: https://gitlab.com/lsm5/cri-o
+Vcs-Browser: https://gitlab.com/lsm5/cri-o
+
+Package: cri-o-1.16
+Architecture: any
+Depends: ${misc:Depends},
+    libgpgme11,
+    libseccomp2,
+    conmon,
+    containers-common (>=0.1.27),
+    cri-o-runc (>=1.0.0),
+Suggests: containernetworking-plugins
+Description: OCI-based implementation of Kubernetes Container Runtime Interface.
+Replaces: cri-o-1.15,
+   cri-o-1.14,
+   cri-o-1.13,
+   cri-o-1.12,
+   cri-o-1.11,
+   cri-o-1.11-stable,
+   cri-o-1.10
