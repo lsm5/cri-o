@@ -4,11 +4,12 @@ import (
 	"context"
 
 	cstorage "github.com/containers/storage"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
+	"github.com/cri-o/cri-o/server/cri/types"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // The actual test suite
@@ -30,17 +31,60 @@ var _ = t.Describe("ImageStatus", func() {
 					Return([]string{"image"}, nil),
 				imageServerMock.EXPECT().ImageStatus(
 					gomock.Any(), gomock.Any()).
-					Return(&storage.ImageResult{ID: "image",
-						User: "10", Size: &size}, nil),
+					Return(&storage.ImageResult{
+						ID:   "image",
+						User: "10", Size: &size,
+					}, nil),
 			)
 
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{Image: &pb.ImageSpec{Image: "image"}})
+				&types.ImageStatusRequest{Image: &types.ImageSpec{Image: "image"}})
 
 			// Then
 			Expect(err).To(BeNil())
 			Expect(response).NotTo(BeNil())
+		})
+
+		It("should succeed verbose", func() {
+			// Given
+			size := uint64(100)
+			gomock.InOrder(
+				imageServerMock.EXPECT().ResolveNames(
+					gomock.Any(), gomock.Any(),
+				).Return(
+					[]string{"image"}, nil,
+				),
+				imageServerMock.EXPECT().ImageStatus(
+					gomock.Any(), gomock.Any(),
+				).Return(
+					&storage.ImageResult{
+						ID:   "image",
+						User: "10",
+						Size: &size,
+						OCIConfig: &specs.Image{
+							Architecture: "arch",
+							OS:           "os",
+						},
+					},
+					nil,
+				),
+			)
+
+			// When
+			response, err := sut.ImageStatus(context.Background(),
+				&types.ImageStatusRequest{
+					Image:   &types.ImageSpec{Image: "image"},
+					Verbose: true,
+				})
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(response).NotTo(BeNil())
+			Expect(response.Info).To(HaveKey("info"))
+			Expect(response.Info["info"]).To(ContainSubstring(
+				`{"imageSpec":{"architecture":"arch","os":"os","config":{}`,
+			))
 		})
 
 		It("should succeed with wrong image id", func() {
@@ -56,7 +100,7 @@ var _ = t.Describe("ImageStatus", func() {
 
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{Image: &pb.ImageSpec{Image: "image"}})
+				&types.ImageStatusRequest{Image: &types.ImageSpec{Image: "image"}})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -76,7 +120,7 @@ var _ = t.Describe("ImageStatus", func() {
 
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{Image: &pb.ImageSpec{Image: "image"}})
+				&types.ImageStatusRequest{Image: &types.ImageSpec{Image: "image"}})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -96,7 +140,7 @@ var _ = t.Describe("ImageStatus", func() {
 
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{Image: &pb.ImageSpec{Image: "image"}})
+				&types.ImageStatusRequest{Image: &types.ImageSpec{Image: "image"}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -113,7 +157,7 @@ var _ = t.Describe("ImageStatus", func() {
 
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{Image: &pb.ImageSpec{Image: "image"}})
+				&types.ImageStatusRequest{Image: &types.ImageSpec{Image: "image"}})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -124,7 +168,7 @@ var _ = t.Describe("ImageStatus", func() {
 			// Given
 			// When
 			response, err := sut.ImageStatus(context.Background(),
-				&pb.ImageStatusRequest{})
+				&types.ImageStatusRequest{})
 
 			// Then
 			Expect(err).NotTo(BeNil())

@@ -22,19 +22,18 @@ import (
 	"hash/fnv"
 	"strings"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
 	hashutil "k8s.io/kubernetes/pkg/util/hash"
 	"k8s.io/kubernetes/third_party/forked/golang/expansion"
+	utilsnet "k8s.io/utils/net"
 )
 
 // HandlerRunner runs a lifecycle handler for a container.
@@ -45,7 +44,7 @@ type HandlerRunner interface {
 // RuntimeHelper wraps kubelet to make container runtime
 // able to get necessary informations like the RunContainerOptions, DNS settings, Host IP.
 type RuntimeHelper interface {
-	GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string) (contOpts *RunContainerOptions, cleanupAction func(), err error)
+	GenerateRunContainerOptions(pod *v1.Pod, container *v1.Container, podIP string, podIPs []string) (contOpts *RunContainerOptions, cleanupAction func(), err error)
 	GetPodDNS(pod *v1.Pod) (dnsConfig *runtimeapi.DNSConfig, err error)
 	// GetPodCgroupParent returns the CgroupName identifier, and its literal cgroupfs form on the host
 	// of a pod.
@@ -61,6 +60,10 @@ type RuntimeHelper interface {
 // ShouldContainerBeRestarted checks whether a container needs to be restarted.
 // TODO(yifan): Think about how to refactor this.
 func ShouldContainerBeRestarted(container *v1.Container, pod *v1.Pod, podStatus *PodStatus) bool {
+	// Once a pod has been marked deleted, it should not be restarted
+	if pod.DeletionTimestamp != nil {
+		return false
+	}
 	// Get latest container status.
 	status := podStatus.FindContainerStatusByName(container.Name)
 	// If the container was never started before, we should start it.
@@ -78,13 +81,13 @@ func ShouldContainerBeRestarted(container *v1.Container, pod *v1.Pod, podStatus 
 	}
 	// Check RestartPolicy for dead container
 	if pod.Spec.RestartPolicy == v1.RestartPolicyNever {
-		klog.V(4).Infof("Already ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
+		klog.V(4).InfoS("Already ran container, do nothing", "pod", klog.KObj(pod), "containerName", container.Name)
 		return false
 	}
 	if pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
 		// Check the exit code.
 		if status.ExitCode == 0 {
-			klog.V(4).Infof("Already successfully ran container %q of pod %q, do nothing", container.Name, format.Pod(pod))
+			klog.V(4).InfoS("Already successfully ran container, do nothing", "pod", klog.KObj(pod), "containerName", container.Name)
 			return false
 		}
 	}
@@ -98,14 +101,14 @@ func HashContainer(container *v1.Container) uint64 {
 	hash := fnv.New32a()
 	// Omit nil or empty field when calculating hash value
 	// Please see https://github.com/kubernetes/kubernetes/issues/53644
-	containerJson, _ := json.Marshal(container)
-	hashutil.DeepHashObject(hash, containerJson)
+	containerJSON, _ := json.Marshal(container)
+	hashutil.DeepHashObject(hash, containerJSON)
 	return uint64(hash.Sum32())
 }
 
-// EnvVarsToMap constructs a map of environment name to value from a slice
+// envVarsToMap constructs a map of environment name to value from a slice
 // of env vars.
-func EnvVarsToMap(envs []EnvVar) map[string]string {
+func envVarsToMap(envs []EnvVar) map[string]string {
 	result := map[string]string{}
 	for _, env := range envs {
 		result[env.Name] = env.Value
@@ -113,9 +116,9 @@ func EnvVarsToMap(envs []EnvVar) map[string]string {
 	return result
 }
 
-// V1EnvVarsToMap constructs a map of environment name to value from a slice
+// v1EnvVarsToMap constructs a map of environment name to value from a slice
 // of env vars.
-func V1EnvVarsToMap(envs []v1.EnvVar) map[string]string {
+func v1EnvVarsToMap(envs []v1.EnvVar) map[string]string {
 	result := map[string]string{}
 	for _, env := range envs {
 		result[env.Name] = env.Value
@@ -128,7 +131,7 @@ func V1EnvVarsToMap(envs []v1.EnvVar) map[string]string {
 // container environment definitions. This does *not* include valueFrom substitutions.
 // TODO: callers should use ExpandContainerCommandAndArgs with a fully resolved list of environment.
 func ExpandContainerCommandOnlyStatic(containerCommand []string, envs []v1.EnvVar) (command []string) {
-	mapping := expansion.MappingFuncFor(V1EnvVarsToMap(envs))
+	mapping := expansion.MappingFuncFor(v1EnvVarsToMap(envs))
 	if len(containerCommand) != 0 {
 		for _, cmd := range containerCommand {
 			command = append(command, expansion.Expand(cmd, mapping))
@@ -137,9 +140,10 @@ func ExpandContainerCommandOnlyStatic(containerCommand []string, envs []v1.EnvVa
 	return command
 }
 
+// ExpandContainerVolumeMounts expands the subpath of the given VolumeMount by replacing variable references with the values of given EnvVar.
 func ExpandContainerVolumeMounts(mount v1.VolumeMount, envs []EnvVar) (string, error) {
 
-	envmap := EnvVarsToMap(envs)
+	envmap := envVarsToMap(envs)
 	missingKeys := sets.NewString()
 	expanded := expansion.Expand(mount.SubPathExpr, func(key string) string {
 		value, ok := envmap[key]
@@ -155,8 +159,9 @@ func ExpandContainerVolumeMounts(mount v1.VolumeMount, envs []EnvVar) (string, e
 	return expanded, nil
 }
 
+// ExpandContainerCommandAndArgs expands the given Container's command by replacing variable references `with the values of given EnvVar.
 func ExpandContainerCommandAndArgs(container *v1.Container, envs []EnvVar) (command []string, args []string) {
-	mapping := expansion.MappingFuncFor(EnvVarsToMap(envs))
+	mapping := expansion.MappingFuncFor(envVarsToMap(envs))
 
 	if len(container.Command) != 0 {
 		for _, cmd := range container.Command {
@@ -173,7 +178,7 @@ func ExpandContainerCommandAndArgs(container *v1.Container, envs []EnvVar) (comm
 	return command, args
 }
 
-// Create an event recorder to record object's event except implicitly required container's, like infra container.
+// FilterEventRecorder creates an event recorder to record object's event except implicitly required container's, like infra container.
 func FilterEventRecorder(recorder record.EventRecorder) record.EventRecorder {
 	return &innerEventRecorder{
 		recorder: recorder,
@@ -185,10 +190,11 @@ type innerEventRecorder struct {
 }
 
 func (irecorder *innerEventRecorder) shouldRecordEvent(object runtime.Object) (*v1.ObjectReference, bool) {
-	if object == nil {
-		return nil, false
-	}
 	if ref, ok := object.(*v1.ObjectReference); ok {
+		// this check is needed AFTER the cast. See https://github.com/kubernetes/kubernetes/issues/95552
+		if ref == nil {
+			return nil, false
+		}
 		if !strings.HasPrefix(ref.FieldPath, ImplicitContainerPrefix) {
 			return ref, true
 		}
@@ -209,12 +215,6 @@ func (irecorder *innerEventRecorder) Eventf(object runtime.Object, eventtype, re
 
 }
 
-func (irecorder *innerEventRecorder) PastEventf(object runtime.Object, timestamp metav1.Time, eventtype, reason, messageFmt string, args ...interface{}) {
-	if ref, ok := irecorder.shouldRecordEvent(object); ok {
-		irecorder.recorder.PastEventf(ref, timestamp, eventtype, reason, messageFmt, args...)
-	}
-}
-
 func (irecorder *innerEventRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
 	if ref, ok := irecorder.shouldRecordEvent(object); ok {
 		irecorder.recorder.AnnotatedEventf(ref, annotations, eventtype, reason, messageFmt, args...)
@@ -222,11 +222,13 @@ func (irecorder *innerEventRecorder) AnnotatedEventf(object runtime.Object, anno
 
 }
 
+// IsHostNetworkPod returns whether the host networking requested for the given Pod.
 // Pod must not be nil.
 func IsHostNetworkPod(pod *v1.Pod) bool {
 	return pod.Spec.HostNetwork
 }
 
+// ConvertPodStatusToRunningPod returns Pod given PodStatus and container runtime string.
 // TODO(random-liu): Convert PodStatus to running Pod, should be deprecated soon
 func ConvertPodStatusToRunningPod(runtimeName string, podStatus *PodStatus) Pod {
 	runningPod := Pod{
@@ -260,11 +262,11 @@ func ConvertPodStatusToRunningPod(runtimeName string, podStatus *PodStatus) Pod 
 }
 
 // SandboxToContainerState converts runtimeapi.PodSandboxState to
-// kubecontainer.ContainerState.
+// kubecontainer.State.
 // This is only needed because we need to return sandboxes as if they were
 // kubecontainer.Containers to avoid substantial changes to PLEG.
 // TODO: Remove this once it becomes obsolete.
-func SandboxToContainerState(state runtimeapi.PodSandboxState) ContainerState {
+func SandboxToContainerState(state runtimeapi.PodSandboxState) State {
 	switch state {
 	case runtimeapi.PodSandboxState_SANDBOX_READY:
 		return ContainerStateRunning
@@ -285,7 +287,7 @@ func FormatPod(pod *Pod) string {
 // GetContainerSpec gets the container spec by containerName.
 func GetContainerSpec(pod *v1.Pod, containerName string) *v1.Container {
 	var containerSpec *v1.Container
-	podutil.VisitContainers(&pod.Spec, func(c *v1.Container) bool {
+	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(), func(c *v1.Container, containerType podutil.ContainerType) bool {
 		if containerName == c.Name {
 			containerSpec = c
 			return false
@@ -298,7 +300,7 @@ func GetContainerSpec(pod *v1.Pod, containerName string) *v1.Container {
 // HasPrivilegedContainer returns true if any of the containers in the pod are privileged.
 func HasPrivilegedContainer(pod *v1.Pod) bool {
 	var hasPrivileged bool
-	podutil.VisitContainers(&pod.Spec, func(c *v1.Container) bool {
+	podutil.VisitContainers(&pod.Spec, podutil.AllFeatureEnabledContainers(), func(c *v1.Container, containerType podutil.ContainerType) bool {
 		if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 			hasPrivileged = true
 			return false
@@ -319,22 +321,30 @@ func MakePortMappings(container *v1.Container) (ports []PortMapping) {
 			HostIP:        p.HostIP,
 		}
 
-		// We need to create some default port name if it's not specified, since
-		// this is necessary for rkt.
-		// http://issue.k8s.io/7710
-		if p.Name == "" {
-			pm.Name = fmt.Sprintf("%s-%s:%d", container.Name, p.Protocol, p.ContainerPort)
-		} else {
-			pm.Name = fmt.Sprintf("%s-%s", container.Name, p.Name)
+		// We need to determine the address family this entry applies to. We do this to ensure
+		// duplicate containerPort / protocol rules work across different address families.
+		// https://github.com/kubernetes/kubernetes/issues/82373
+		family := "any"
+		if p.HostIP != "" {
+			if utilsnet.IsIPv6String(p.HostIP) {
+				family = "v6"
+			} else {
+				family = "v4"
+			}
 		}
 
-		// Protect against exposing the same protocol-port more than once in a container.
-		if _, ok := names[pm.Name]; ok {
-			klog.Warningf("Port name conflicted, %q is defined more than once", pm.Name)
+		var name string = p.Name
+		if name == "" {
+			name = fmt.Sprintf("%s-%s-%s:%d:%d", family, p.Protocol, p.HostIP, p.ContainerPort, p.HostPort)
+		}
+
+		// Protect against a port name being used more than once in a container.
+		if _, ok := names[name]; ok {
+			klog.InfoS("Port name conflicted, it is defined more than once", "portName", name)
 			continue
 		}
 		ports = append(ports, pm)
-		names[pm.Name] = struct{}{}
+		names[name] = struct{}{}
 	}
 	return
 }

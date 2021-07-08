@@ -4,7 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/go-zoo/bone"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
@@ -23,10 +24,9 @@ var _ = t.Describe("Inspect", func() {
 		setupSUT()
 
 		recorder = httptest.NewRecorder()
-		mux = sut.GetInfoMux()
+		mux = sut.GetInfoMux(false)
 		Expect(mux).NotTo(BeNil())
 		Expect(recorder).NotTo(BeNil())
-
 	})
 	AfterEach(afterEach)
 
@@ -46,6 +46,7 @@ var _ = t.Describe("Inspect", func() {
 		It("should succeed with valid /containers route", func() {
 			// Given
 			Expect(sut.AddSandbox(testSandbox)).To(BeNil())
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{})
 			Expect(testSandbox.SetInfraContainer(testContainer)).To(BeNil())
 			sut.AddContainer(testContainer)
 			gomock.InOrder(
@@ -67,6 +68,7 @@ var _ = t.Describe("Inspect", func() {
 		It("should fail if sandbox not found on /containers route", func() {
 			// Given
 			Expect(sut.AddSandbox(testSandbox)).To(BeNil())
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{})
 			Expect(testSandbox.SetInfraContainer(testContainer)).To(BeNil())
 			sut.AddContainer(testContainer)
 			Expect(sut.RemoveSandbox(testSandbox.ID())).To(BeNil())
@@ -124,6 +126,5 @@ var _ = t.Describe("Inspect", func() {
 			Expect(request).NotTo(BeNil())
 			Expect(recorder.Code).To(BeEquivalentTo(http.StatusNotFound))
 		})
-
 	})
 })

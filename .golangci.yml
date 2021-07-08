@@ -3,54 +3,90 @@ run:
   build-tags:
     - apparmor
     - containers_image_ostree_stub
-    - seccomp
+    # containers/image would use mtrmac/gpgme otherwise, which requires gpgme C headers
+    - containers_image_openpgp
     - selinux
     - test
-    # containers/storage currently has btrfs included, but the images don't, so
-    # the linter fails.
+    # needs btrfs headers installed
     - exclude_graphdriver_btrfs
+    # needs devmapper headers installed
+    - exclude_graphdriver_devicemapper
   concurrency: 6
   deadline: 5m
 linters:
   disable-all: true
   enable:
+    - asciicheck
     - bodyclose
     - deadcode
     - depguard
     - dogsled
     - dupl
+    - durationcheck
     - errcheck
+    - exportloopref
+    - forcetypeassert
     - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
     - gofmt
+    - gofumpt
+    - goheader
     - goimports
-    - golint
-    - gosec
+    - goprintffuncname
     - gosimple
     - govet
+    - importas
     - ineffassign
-    - interfacer
-    - maligned
+    - makezero
     - misspell
     - nakedret
+    - nolintlint
     - prealloc
-    - scopelint
+    - rowserrcheck
+    - sqlclosecheck
     - staticcheck
     - structcheck
     - stylecheck
+    - tparallel
     - typecheck
     - unconvert
     - unparam
     - unused
     - varcheck
     - whitespace
+    # - cyclop
+    # - errorlint
+    # - exhaustive
+    # - exhaustivestruct
+    # - forbidigo
     # - funlen
+    # - gci
     # - gochecknoglobals
     # - gocognit
+    # - godot
     # - godox
+    # - goerr113
+    # - gomnd
+    # - gomoddirectives
+    # - gomodguard
+    # - gosec
+    # - ifshort
     # - lll
+    # - nestif
+    # - nilerr
+    # - nlreturn
+    # - noctx
+    # - paralleltest
+    # - predeclared
+    # - promlinter
+    # - revive
+    # - tagliatelle
+    # - testpackage
+    # - thelper
+    # - wastedassign
+    # - wrapcheck
     # - wsl
 linters-settings:
   errcheck:

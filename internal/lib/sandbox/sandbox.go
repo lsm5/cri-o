@@ -1,74 +1,29 @@
 package sandbox
 
 import (
-	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/cri-o/cri-o/internal/config/nsmgr"
+	"github.com/cri-o/cri-o/internal/hostport"
 	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/server/cri/types"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/fields"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
 )
 
-func isSymbolicLink(path string) (bool, error) {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return false, err
-	}
+// DevShmPath is the default system wide shared memory path
+const DevShmPath = "/dev/shm"
 
-	return fi.Mode()&os.ModeSymlink == os.ModeSymlink, nil
-}
-
-// NetNsGet returns the NetNs associated with the given nspath and name
-func (s *Sandbox) NetNsGet(nspath, name string) (*NetNs, error) {
-	if err := ns.IsNSorErr(nspath); err != nil {
-		return nil, ErrClosedNetNS
-	}
-
-	symlink, symlinkErr := isSymbolicLink(nspath)
-	if symlinkErr != nil {
-		return nil, symlinkErr
-	}
-
-	var resolvedNsPath string
-	if symlink {
-		path, err := os.Readlink(nspath)
-		if err != nil {
-			return nil, err
-		}
-		resolvedNsPath = path
-	} else {
-		resolvedNsPath = nspath
-	}
-
-	netNs, err := getNetNs(resolvedNsPath)
-	if err != nil {
-		return nil, err
-	}
-
-	if symlink {
-		fd, err := os.Open(nspath)
-		if err != nil {
-			return nil, err
-		}
-
-		netNs.symlink = fd
-	} else if err := netNs.SymlinkCreate(name); err != nil {
-		return nil, err
-	}
-
-	return netNs, nil
-}
-
-// HostNetNsPath returns the current network namespace for the host
-func HostNetNsPath() (string, error) {
-	return hostNetNsPath()
-}
+var (
+	sbStoppedFilename        = "stopped"
+	sbNetworkStoppedFilename = "network-stopped"
+)
 
 // Sandbox contains data surrounding kubernetes sandboxes on the server
 type Sandbox struct {
@@ -84,7 +39,10 @@ type Sandbox struct {
 	containers     oci.ContainerStorer
 	processLabel   string
 	mountLabel     string
-	netns          NetNsIface
+	netns          nsmgr.Namespace
+	ipcns          nsmgr.Namespace
+	utsns          nsmgr.Namespace
+	userns         nsmgr.Namespace
 	shmPath        string
 	cgroupParent   string
 	runtimeHandler string
@@ -97,56 +55,41 @@ type Sandbox struct {
 	labels             fields.Set
 	annotations        map[string]string
 	infraContainer     *oci.Container
-	metadata           *pb.PodSandboxMetadata
-	nsOpts             *pb.NamespaceOption
+	metadata           *Metadata
+	nsOpts             *types.NamespaceOption
 	stopMutex          sync.RWMutex
 	created            bool
 	stopped            bool
+	networkStopped     bool
 	privileged         bool
 	hostNetwork        bool
+	usernsMode         string
 }
 
-// NetNsIface provides a generic network namespace interface
-type NetNsIface interface {
-	// Close closes this network namespace
-	Close() error
+type Metadata struct {
+	// Pod name of the sandbox.
+	Name string `json:"name,omitempty"`
 
-	// Get returns the native NetNs
-	Get() *NetNs
+	// Pod UID of the sandbox.
+	UID string `json:"uid,omitempty"`
 
-	// Initialize does the necessary setup
-	Initialize() (NetNsIface, error)
+	// Pod namespace of the sandbox.
+	Namespace string `json:"namespace,omitempty"`
 
-	// Initialized returns true if already initialized
-	Initialized() bool
-
-	// Remove ensures this network namespace handle is closed and removed
-	Remove() error
-
-	// SymlinkCreate creates all necessary symlinks
-	SymlinkCreate(string) error
+	// Attempt number of creating the sandbox.
+	Attempt uint32 `json:"attempt,omitempty"`
 }
 
-const (
-	// DefaultShmSize is the default shm size
-	DefaultShmSize = 64 * 1024 * 1024
-	// NsRunDir is the default directory in which running network namespaces
-	// are stored
-	NsRunDir = "/var/run/netns"
-)
+// DefaultShmSize is the default shm size
+const DefaultShmSize = 64 * 1024 * 1024
 
-var (
-	// ErrIDEmpty is the error returned when the id of the sandbox is empty
-	ErrIDEmpty = errors.New("PodSandboxId should not be empty")
-	// ErrClosedNetNS is the error returned when the network namespace of the
-	// sandbox is closed
-	ErrClosedNetNS = errors.New("PodSandbox networking namespace is closed")
-)
+// ErrIDEmpty is the error returned when the id of the sandbox is empty
+var ErrIDEmpty = errors.New("PodSandboxId should not be empty")
 
 // New creates and populates a new pod sandbox
 // New sandboxes have no containers, no infra container, and no network namespaces associated with them
 // An infra container must be attached before the sandbox is added to the state
-func New(id, namespace, name, kubeName, logDir string, labels, annotations map[string]string, processLabel, mountLabel string, metadata *pb.PodSandboxMetadata, shmPath, cgroupParent string, privileged bool, runtimeHandler, resolvPath, hostname string, portMappings []*hostport.PortMapping, hostNetwork bool) (*Sandbox, error) {
+func New(id, namespace, name, kubeName, logDir string, labels, annotations map[string]string, processLabel, mountLabel string, metadata *Metadata, shmPath, cgroupParent string, privileged bool, runtimeHandler, resolvPath, hostname string, portMappings []*hostport.PortMapping, hostNetwork bool, createdAt time.Time, usernsMode string) (*Sandbox, error) {
 	sb := new(Sandbox)
 	sb.id = id
 	sb.namespace = namespace
@@ -166,10 +109,15 @@ func New(id, namespace, name, kubeName, logDir string, labels, annotations map[s
 	sb.resolvPath = resolvPath
 	sb.hostname = hostname
 	sb.portMappings = portMappings
-	sb.createdAt = time.Now()
+	sb.createdAt = createdAt
 	sb.hostNetwork = hostNetwork
+	sb.usernsMode = usernsMode
 
 	return sb, nil
+}
+
+func (s *Sandbox) CreatedAt() time.Time {
+	return s.createdAt
 }
 
 // SetSeccompProfilePath sets the seccomp profile path
@@ -188,12 +136,12 @@ func (s *Sandbox) AddIPs(ips []string) {
 }
 
 // SetNamespaceOptions sets whether the pod is running using host network
-func (s *Sandbox) SetNamespaceOptions(nsOpts *pb.NamespaceOption) {
+func (s *Sandbox) SetNamespaceOptions(nsOpts *types.NamespaceOption) {
 	s.nsOpts = nsOpts
 }
 
 // NamespaceOptions returns the namespace options for the sandbox
-func (s *Sandbox) NamespaceOptions() *pb.NamespaceOption {
+func (s *Sandbox) NamespaceOptions() *types.NamespaceOption {
 	return s.nsOpts
 }
 
@@ -210,6 +158,11 @@ func (s *Sandbox) IPs() []string {
 // ID returns the id of the sandbox
 func (s *Sandbox) ID() string {
 	return s.id
+}
+
+// UsernsMode returns the mode for setting the user namespace, if any.
+func (s *Sandbox) UsernsMode() string {
+	return s.usernsMode
 }
 
 // Namespace returns the namespace for the sandbox
@@ -242,11 +195,6 @@ func (s *Sandbox) Annotations() map[string]string {
 	return s.annotations
 }
 
-// InfraContainer returns the infrastructure container for the sandbox
-func (s *Sandbox) InfraContainer() *oci.Container {
-	return s.infraContainer
-}
-
 // Containers returns the ContainerStorer that contains information on all
 // of the containers in the sandbox
 func (s *Sandbox) Containers() oci.ContainerStorer {
@@ -264,7 +212,7 @@ func (s *Sandbox) MountLabel() string {
 }
 
 // Metadata returns a set of metadata about the sandbox
-func (s *Sandbox) Metadata() *pb.PodSandboxMetadata {
+func (s *Sandbox) Metadata() *Metadata {
 	return s.metadata
 }
 
@@ -350,79 +298,31 @@ func (s *Sandbox) SetInfraContainer(infraCtr *oci.Container) error {
 	return nil
 }
 
+// InfraContainer returns the infrastructure container for the sandbox
+func (s *Sandbox) InfraContainer() *oci.Container {
+	return s.infraContainer
+}
+
 // RemoveInfraContainer removes the infrastructure container of a sandbox
 func (s *Sandbox) RemoveInfraContainer() {
 	s.infraContainer = nil
 }
 
-// NetNs retrieves the network namespace of the sandbox
-// If the sandbox uses the host namespace, nil is returned
-func (s *Sandbox) NetNs() *NetNs {
-	if s.netns == nil {
-		return nil
-	}
-	return s.netns.Get()
-}
-
-// NetNsPath returns the path to the network namespace of the sandbox.
-// If the sandbox uses the host namespace, nil is returned
-func (s *Sandbox) NetNsPath() string {
-	if s.netns == nil || s.netns.Get() == nil ||
-		s.netns.Get().symlink == nil {
-		if s.infraContainer != nil {
-			return fmt.Sprintf("/proc/%v/ns/net", s.infraContainer.State().Pid)
-		}
-		return ""
-	}
-
-	return s.netns.Get().symlink.Name()
-}
-
-// UserNsPath returns the path to the user namespace of the sandbox.
-// If the sandbox uses the host namespace, nil is returned
-func (s *Sandbox) UserNsPath() string {
-	if s.infraContainer != nil {
-		return fmt.Sprintf("/proc/%v/ns/user", s.infraContainer.State().Pid)
-	}
-	return ""
-}
-
-// NetNsCreate creates a new network namespace for the sandbox
-func (s *Sandbox) NetNsCreate(netNs NetNsIface) error {
-	// Create a new netNs if nil provided
-	if netNs == nil {
-		netNs = &NetNs{}
-	}
-
-	// Check if interface is already initialized
-	if netNs.Initialized() {
-		return fmt.Errorf("net NS already initialized")
-	}
-
-	netNs, err := netNs.Initialize()
-	if err != nil {
-		return err
-	}
-
-	if err := netNs.SymlinkCreate(s.name); err != nil {
-		logrus.Warnf("Could not create nentns symlink %v", err)
-
-		if err1 := netNs.Close(); err1 != nil {
-			return err1
-		}
-
-		return err
-	}
-
-	s.netns = netNs
-	return nil
-}
-
 // SetStopped sets the sandbox state to stopped.
 // This should be set after a stop operation succeeds
 // so that subsequent stops can return fast.
-func (s *Sandbox) SetStopped() {
+// if createFile is true, it also creates a "stopped" file in the infra container's persistent dir
+// this is used to track the sandbox is stopped over reboots
+func (s *Sandbox) SetStopped(createFile bool) {
+	if s.stopped {
+		return
+	}
 	s.stopped = true
+	if createFile {
+		if err := s.createFileInInfraDir(sbStoppedFilename); err != nil {
+			logrus.Errorf("Failed to create stopped file in container state. Restore may fail: %v", err)
+		}
+	}
 }
 
 // Stopped returns whether the sandbox state has been
@@ -431,39 +331,129 @@ func (s *Sandbox) Stopped() bool {
 	return s.stopped
 }
 
-// NetNsJoin attempts to join the sandbox to an existing network namespace
-// This will fail if the sandbox is already part of a network namespace
-func (s *Sandbox) NetNsJoin(nspath, name string) error {
-	if s.netns != nil {
-		return fmt.Errorf("sandbox already has a network namespace, cannot join another")
-	}
-
-	netNS, err := s.NetNsGet(nspath, name)
-	if err != nil {
-		return err
-	}
-
-	s.netns = netNS
-
-	return nil
-}
-
-// NetNsRemove removes the network namespace associated with the sandbox
-func (s *Sandbox) NetNsRemove() error {
-	if s.netns == nil {
-		logrus.Warn("no networking namespace")
-		return nil
-	}
-
-	return s.netns.Remove()
-}
-
 // SetCreated sets the created status of sandbox to true
 func (s *Sandbox) SetCreated() {
 	s.created = true
 }
 
+// NetworkStopped returns whether the network has been stopped
+func (s *Sandbox) NetworkStopped() bool {
+	return s.networkStopped
+}
+
+// SetNetworkStopped sets the sandbox network state as stopped
+// This should be set after a network stop operation succeeds,
+// so we don't double stop the network
+// if createFile is true, it creates a "network-stopped" file
+// in the infra container's persistent dir
+// this is used to track the network is stopped over reboots
+// returns an error if an error occurred when creating the network-stopped file
+func (s *Sandbox) SetNetworkStopped(createFile bool) error {
+	if s.networkStopped {
+		return nil
+	}
+	s.networkStopped = true
+	if createFile {
+		if err := s.createFileInInfraDir(sbNetworkStoppedFilename); err != nil {
+			return fmt.Errorf("failed to create state file in container directory. Restores may fail: %v", err)
+		}
+	}
+	return nil
+}
+
+func (s *Sandbox) createFileInInfraDir(filename string) error {
+	// If the sandbox is not yet created,
+	// this function is being called when
+	// cleaning up a failed sandbox creation.
+	// We don't need to create the file, as there will be no
+	// sandbox to restore
+	if !s.created {
+		return nil
+	}
+	infra := s.InfraContainer()
+	// If the infra directory has been cleaned up already, we should not fail to
+	// create this file.
+	if _, err := os.Stat(infra.Dir()); os.IsNotExist(err) {
+		return nil
+	}
+	f, err := os.Create(filepath.Join(infra.Dir(), filename))
+	if err == nil {
+		f.Close()
+	}
+	return err
+}
+
+func (s *Sandbox) RestoreStopped() {
+	if s.fileExistsInInfraDir(sbStoppedFilename) {
+		s.stopped = true
+	}
+	if s.fileExistsInInfraDir(sbNetworkStoppedFilename) {
+		s.networkStopped = true
+	}
+}
+
+func (s *Sandbox) fileExistsInInfraDir(filename string) bool {
+	infra := s.InfraContainer()
+	infraFilePath := filepath.Join(infra.Dir(), filename)
+	if _, err := os.Stat(infraFilePath); err != nil {
+		if !os.IsNotExist(err) {
+			logrus.Warnf("Error checking if %s exists: %v", infraFilePath, err)
+		}
+		return false
+	}
+	return true
+}
+
 // Created returns the created status of sandbox
 func (s *Sandbox) Created() bool {
 	return s.created
+}
+
+// Ready returns whether the sandbox should be marked as ready to the kubelet
+// if there is no infra container, it is always considered ready.
+// `takeLock` should be set if we need to take the lock to get the infra container's state.
+// If there is no infra container, it is never considered ready.
+// If the infra container is spoofed, the pod is considered ready when it has been created, but not stopped.
+func (s *Sandbox) Ready(takeLock bool) bool {
+	podInfraContainer := s.InfraContainer()
+	if podInfraContainer == nil {
+		return false
+	}
+	if podInfraContainer.Spoofed() {
+		return s.created && !s.stopped
+	}
+	// Assume the sandbox is ready, unless it has an infra container that
+	// isn't running
+	var cState *oci.ContainerState
+	if takeLock {
+		cState = podInfraContainer.State()
+	} else {
+		cState = podInfraContainer.StateNoLock()
+	}
+
+	return cState.Status == oci.ContainerStateRunning
+}
+
+// UnmountShm removes the shared memory mount for the sandbox and returns an
+// error if any failure occurs.
+func (s *Sandbox) UnmountShm() error {
+	fp := s.ShmPath()
+	if fp == DevShmPath {
+		return nil
+	}
+
+	// try to unmount, ignoring "not mounted" (EINVAL) error and
+	// "already unmounted" (ENOENT) error
+	if err := unix.Unmount(fp, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
+		return errors.Wrapf(err, "unable to unmount %s", fp)
+	}
+
+	return nil
+}
+
+// NeedsInfra is a function that returns whether the sandbox will need an infra container.
+// If the server manages the namespace lifecycles, and the Pid option on the sandbox
+// is node or container level, the infra container is not needed
+func (s *Sandbox) NeedsInfra(serverDropsInfra bool) bool {
+	return !serverDropsInfra || s.nsOpts.Pid == types.NamespaceModePOD
 }

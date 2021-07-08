@@ -24,13 +24,13 @@ func UnaryInterceptor() grpc.UnaryServerInterceptor {
 		resp, err := handler(ctx, req)
 
 		// record the operation
-		CRIOOperations.WithLabelValues(operation).Inc()
-		CRIOOperationsLatency.WithLabelValues(operation).
-			Observe(SinceInMicroseconds(operationStart))
+		Instance().MetricOperationsInc(operation)
+		Instance().MetricOperationsLatencySet(operation, operationStart)
+		Instance().MetricOperationsLatencyTotalObserve(operation, operationStart)
 
 		// record error metric if occurred
 		if err != nil {
-			CRIOOperationsErrors.WithLabelValues(operation).Inc()
+			Instance().MetricOperationsErrorsInc(operation)
 		}
 
 		return resp, err

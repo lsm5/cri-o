@@ -8,8 +8,10 @@ that we follow.
 ## Topics
 
 * [Reporting Issues](#reporting-issues)
+* [Working On Issues](#working-on-issues)
 * [Submitting Pull Requests](#submitting-pull-requests)
 * [Sign your PRs](#sign-your-prs)
+* [Merge bot interaction](#merge-bot-interaction)
 * [Communications](#communications)
 * [Becoming a Maintainer](#becoming-a-maintainer)
 
@@ -28,6 +30,17 @@ to remove the extra stuff that doesn't really relate to the issue itself.
 The easier it is for us to reproduce it, the faster it'll be fixed!
 
 Please don't include any private/sensitive information in your issue!
+
+## Working On Issues
+
+Once you have decided to contribute to Buildah by working on an issue, check our
+backlog of [open issues](https://github.com/containers/buildah/issues) looking
+for any that do not have an "In Progress" label attached to it.  Often issues
+will be assigned to someone, to be worked on at a later time.  If you have the
+time to work on the issue now, add yourself as an assignee, and set the
+"In Progress" label if you’re a member of the “Containers” GitHub organization.
+If you can not set the label, just  add a quick comment in the issue asking that
+the “In Progress” label be set and a member will do so for you.
 
 ## Submitting Pull Requests
 
@@ -116,6 +129,17 @@ Use your real name (sorry, no pseudonyms or anonymous contributions.)
 If you set your `user.name` and `user.email` git configs, you can sign your
 commit automatically with `git commit -s`.
 
+## Merge bot interaction
+
+Maintainers should never merge anything directly into upstream
+branches.  Instead, interact with the [openshift-ci-robot](https://github.com/openshift-ci-robot/)
+through PR comments as summarized [here](https://prow.ci.openshift.org/command-help?repo=containers%2Fbuildah).
+This ensures all upstream
+branches contain commits in a predictable order, and that every commit
+has passed automated testing at some point in the past. A
+[Maintainer portal](https://prow.ci.openshift.org/pr?query=is%3Apr%20state%3Aopen%20repo%3Acontainers%2Fbuildah)
+is available, showing all PRs awaiting review and approval.
+
 ## Communications
 
 For general questions or discussions, please use the
@@ -126,7 +150,7 @@ that has been setup.
 
 #### Buildah Mailing List
 
-You can join the Buildah mailing list by sending an email to `buildah-join@lists.buildah.io` with the word `subscribe` in the subject.  You can also go to this [page](https://lists.podman.io/admin/lists/buildah.lists.buildah.io/), then scroll down to the bottom of the page and enter your email and optionally name, then click on the "Subscribe" buton.
+You can join the Buildah mailing list by sending an email to `buildah-join@lists.buildah.io` with the word `subscribe` in the subject.  You can also go to this [page](https://lists.podman.io/admin/lists/buildah.lists.buildah.io/), then scroll down to the bottom of the page and enter your email and optionally name, then click on the "Subscribe" button.
 
 #### GitHub
 You can also use the github

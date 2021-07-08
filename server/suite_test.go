@@ -4,19 +4,20 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/containers/image/v4/types"
 	cstorage "github.com/containers/storage"
-	"github.com/cri-o/cri-o/internal/lib/config"
+	"github.com/cri-o/cri-o/internal/hostport"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server"
 	. "github.com/cri-o/cri-o/test/framework"
-	imagetypesmock "github.com/cri-o/cri-o/test/mocks/containers/image"
+	imagetypesmock "github.com/cri-o/cri-o/test/mocks/containers/image/v5"
 	containerstoragemock "github.com/cri-o/cri-o/test/mocks/containerstorage"
 	criostoragemock "github.com/cri-o/cri-o/test/mocks/criostorage"
 	libmock "github.com/cri-o/cri-o/test/mocks/lib"
@@ -26,9 +27,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
-	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming"
 )
 
 // TestServer runs the created specs
@@ -128,7 +127,7 @@ var beforeEach = func() {
 		},
 		"linux": {
 			"namespaces": [
-				{"type": "network", "path": "default"}
+				{"type": "network", "path": "/proc/self/ns/net"}
 			]
 		},
 		"process": {
@@ -144,6 +143,7 @@ var beforeEach = func() {
 	serverConfig.ContainerAttachSocketDir = testPath
 	serverConfig.ContainerExitsDir = path.Join(testPath, "exits")
 	serverConfig.LogDir = path.Join(testPath, "log")
+	serverConfig.CleanShutdownFile = path.Join(testPath, "clean.shutdown")
 
 	// We want a directory that is guaranteed to exist, but it must
 	// be empty so we don't erroneously load anything and make tests
@@ -155,15 +155,15 @@ var beforeEach = func() {
 	// Initialize test container and sandbox
 	testSandbox, err = sandbox.New(sandboxID, "", "", "", "",
 		make(map[string]string), make(map[string]string), "", "",
-		&pb.PodSandboxMetadata{}, "", "", false, "", "", "",
-		[]*hostport.PortMapping{}, false)
+		&sandbox.Metadata{}, "", "", false, "", "", "",
+		[]*hostport.PortMapping{}, false, time.Now(), "")
 	Expect(err).To(BeNil())
 
-	testContainer, err = oci.NewContainer(containerID, "", "", "", "",
+	testContainer, err = oci.NewContainer(containerID, "", "", "",
 		make(map[string]string), make(map[string]string),
-		make(map[string]string), "", "", "",
-		&pb.ContainerMetadata{}, sandboxID, false, false,
-		false, false, "", "", time.Now(), "")
+		make(map[string]string), "pauseImage", "", "",
+		&oci.Metadata{}, sandboxID, false, false,
+		false, "", "", time.Now(), "")
 	Expect(err).To(BeNil())
 
 	// Initialize test streaming server
@@ -182,20 +182,16 @@ var afterEach = func() {
 }
 
 var setupSUT = func() {
-	setupSUTWithContext(nil)
-}
-
-var setupSUTWithContext = func(ctx *types.SystemContext) {
 	var err error
 	mockNewServer()
-	sut, err = server.New(context.Background(), ctx, "", libMock)
+	sut, err = server.New(context.Background(), libMock)
 	Expect(err).To(BeNil())
 	Expect(sut).NotTo(BeNil())
 
 	// Inject the mock
 	sut.SetStorageImageServer(imageServerMock)
 	sut.SetStorageRuntimeServer(runtimeServerMock)
-	Expect(sut.SetNetPlugin(cniPluginMock)).To(BeNil())
+	Expect(sut.SetCNIPlugin(cniPluginMock)).To(BeNil())
 }
 
 func mockNewServer() {
@@ -214,14 +210,8 @@ func addContainerAndSandbox() {
 	sut.AddContainer(testContainer)
 	Expect(sut.CtrIDIndex().Add(testContainer.ID())).To(BeNil())
 	Expect(sut.PodIDIndex().Add(testSandbox.ID())).To(BeNil())
-}
-
-func addContainerAndSandboxRuntimeServer() {
-	Expect(testStreamService.RuntimeServer().AddSandbox(testSandbox)).To(BeNil())
-	Expect(testSandbox.SetInfraContainer(testContainer)).To(BeNil())
-	testStreamService.RuntimeServer().AddContainer(testContainer)
-	Expect(testStreamService.RuntimeServer().CtrIDIndex().Add(testContainer.ID()))
-	Expect(testStreamService.RuntimeServer().PodIDIndex().Add(testSandbox.ID()))
+	testContainer.SetCreated()
+	testSandbox.SetCreated()
 }
 
 var mockDirs = func(manifest []byte) {
@@ -237,11 +227,13 @@ var mockDirs = func(manifest []byte) {
 }
 
 func createDummyState() {
-	Expect(ioutil.WriteFile("state.json", []byte(`{}`), 0644)).To(BeNil())
+	Expect(ioutil.WriteFile("state.json", []byte(`{}`), 0o644)).To(BeNil())
 }
 
 func mockRuncInLibConfig() {
+	echo, err := exec.LookPath("echo")
+	Expect(err).To(BeNil())
 	serverConfig.Runtimes["runc"] = &config.RuntimeHandler{
-		RuntimePath: "/bin/echo",
+		RuntimePath: echo,
 	}
 }

@@ -2,42 +2,42 @@ package main
 
 import (
 	"context"
-	goflag "flag"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	gruntime "runtime"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/containers/image/v4/types"
-	_ "github.com/containers/libpod/pkg/hooks/0.1.0"
+	_ "github.com/containers/podman/v3/pkg/hooks/0.1.0"
 	"github.com/containers/storage/pkg/reexec"
-	libconfig "github.com/cri-o/cri-o/internal/lib/config"
-	"github.com/cri-o/cri-o/internal/pkg/criocli"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	"github.com/cri-o/cri-o/internal/pkg/signals"
+	"github.com/cri-o/cri-o/internal/criocli"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/internal/signals"
 	"github.com/cri-o/cri-o/internal/version"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"github.com/cri-o/cri-o/server"
+	v1 "github.com/cri-o/cri-o/server/cri/v1"
+	"github.com/cri-o/cri-o/server/cri/v1alpha2"
 	"github.com/cri-o/cri-o/server/metrics"
 	"github.com/cri-o/cri-o/utils"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/sirupsen/logrus"
 	"github.com/soheilhy/cmux"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
-	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
-// gitCommit is the commit that the binary is being built from.
-// It will be populated by the Makefile.
-var gitCommit = ""
-
 func writeCrioGoroutineStacks() {
-	path := filepath.Join("/tmp", fmt.Sprintf("crio-goroutine-stacks-%s.log", strings.Replace(time.Now().Format(time.RFC3339), ":", "", -1))) // nolint: gocritic
+	path := filepath.Join("/tmp", fmt.Sprintf(
+		"crio-goroutine-stacks-%s.log",
+		strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""),
+	))
 	if err := utils.WriteGoroutineStacksToFile(path); err != nil {
 		logrus.Warnf("Failed to write goroutine stacks: %s", err)
 	}
@@ -45,7 +45,7 @@ func writeCrioGoroutineStacks() {
 
 func catchShutdown(ctx context.Context, cancel context.CancelFunc, gserver *grpc.Server, sserver *server.Server, hserver *http.Server, signalled *bool) {
 	sig := make(chan os.Signal, 2048)
-	signal.Notify(sig, signals.Interrupt, signals.Term, unix.SIGUSR1, unix.SIGPIPE, signals.Hup)
+	signal.Notify(sig, signals.Interrupt, signals.Term, unix.SIGUSR1, unix.SIGUSR2, unix.SIGPIPE, signals.Hup)
 	go func() {
 		for s := range sig {
 			logrus.WithFields(logrus.Fields{
@@ -54,6 +54,9 @@ func catchShutdown(ctx context.Context, cancel context.CancelFunc, gserver *grpc
 			switch s {
 			case unix.SIGUSR1:
 				writeCrioGoroutineStacks()
+				continue
+			case unix.SIGUSR2:
+				gruntime.GC()
 				continue
 			case unix.SIGPIPE:
 				continue
@@ -68,24 +71,34 @@ func catchShutdown(ctx context.Context, cancel context.CancelFunc, gserver *grpc
 			gserver.GracefulStop()
 			hserver.Shutdown(ctx) // nolint: errcheck
 			if err := sserver.StopStreamServer(); err != nil {
-				logrus.Warnf("error shutting down streaming server: %v", err)
+				logrus.Warnf("Error shutting down streaming server: %v", err)
 			}
 			sserver.StopMonitors()
 			cancel()
 			if err := sserver.Shutdown(ctx); err != nil {
-				logrus.Warnf("error shutting down main service %v", err)
+				logrus.Warnf("Error shutting down main service %v", err)
 			}
 			return
 		}
 	}()
 }
 
+const usage = `OCI-based implementation of Kubernetes Container Runtime Interface Daemon
+
+crio is meant to provide an integration path between OCI conformant runtimes
+and the kubelet. Specifically, it implements the Kubelet Container Runtime
+Interface (CRI) using OCI conformant runtimes. The scope of crio is tied to the
+scope of the CRI.
+
+1. Support multiple image formats including the existing Docker and OCI image formats.
+2. Support for multiple means to download images including trust & image verification.
+3. Container image management (managing image layers, overlay filesystems, etc).
+4. Container process lifecycle management.
+5. Monitoring and logging required to satisfy the CRI.
+6. Resource isolation as required by the CRI.`
+
 func main() {
-	// https://github.com/kubernetes/kubernetes/issues/17162
-	if err := goflag.CommandLine.Parse([]string{}); err != nil {
-		fmt.Fprintf(os.Stderr, "unable to parse command line flags\n")
-		os.Exit(-1)
-	}
+	log.InitKlogShim()
 
 	if reexec.Init() {
 		fmt.Fprintf(os.Stderr, "unable to initialize container storage\n")
@@ -93,19 +106,15 @@ func main() {
 	}
 	app := cli.NewApp()
 
-	var v []string
-	v = append(v, version.Version)
-	if gitCommit != "" && gitCommit != "unknown" {
-		v = append(v, fmt.Sprintf("commit: %s", gitCommit))
-	}
 	app.Name = "crio"
-	app.Usage = "crio server"
-	app.Version = strings.Join(v, "\n")
-
-	systemContext := &types.SystemContext{}
+	app.Usage = "OCI-based implementation of Kubernetes Container Runtime Interface"
+	app.Authors = []*cli.Author{{Name: "The CRI-O Maintainers"}}
+	app.UsageText = usage
+	app.Description = app.Usage
+	app.Version = version.Version + "\n" + version.Get().String()
 
 	var err error
-	app.Flags, app.Metadata, err = criocli.GetFlagsAndMetadata(systemContext)
+	app.Flags, app.Metadata, err = criocli.GetFlagsAndMetadata()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -114,26 +123,24 @@ func main() {
 	sort.Sort(cli.FlagsByName(app.Flags))
 	sort.Sort(cli.FlagsByName(configCommand.Flags))
 
-	app.Commands = []cli.Command{
+	app.Commands = criocli.DefaultCommands
+	app.Commands = append(app.Commands, []*cli.Command{
 		configCommand,
-		criocli.Completion,
+		versionCommand,
 		wipeCommand,
-	}
+	}...)
 
-	var configPath string
 	app.Before = func(c *cli.Context) (err error) {
-		var config *libconfig.Config
-		configPath, config, err = criocli.GetConfigFromContext(c)
+		config, err := criocli.GetAndMergeConfigFromContext(c)
 		if err != nil {
 			return err
 		}
 
-		cf := &logrus.TextFormatter{
+		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: "2006-01-02 15:04:05.000000000Z07:00",
 			FullTimestamp:   true,
-		}
-
-		logrus.SetFormatter(cf)
+		})
+		version.LogVersion()
 
 		level, err := logrus.ParseLevel(config.LogLevel)
 		if err != nil {
@@ -148,21 +155,21 @@ func main() {
 		}
 		logrus.AddHook(filterHook)
 
-		if path := c.GlobalString("log"); path != "" {
-			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0666)
+		if path := c.String("log"); path != "" {
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_SYNC, 0o666)
 			if err != nil {
 				return err
 			}
 			logrus.SetOutput(f)
 		}
 
-		switch c.GlobalString("log-format") {
+		switch c.String("log-format") {
 		case "text":
 			// retain logrus's default.
 		case "json":
 			logrus.SetFormatter(new(logrus.JSONFormatter))
 		default:
-			return fmt.Errorf("unknown log-format %q", c.GlobalString("log-format"))
+			return fmt.Errorf("unknown log-format %q", c.String("log-format"))
 		}
 
 		return nil
@@ -170,27 +177,20 @@ func main() {
 
 	app.Action = func(c *cli.Context) error {
 		ctx, cancel := context.WithCancel(context.Background())
-		if c.GlobalBool("profile") {
-			profilePort := c.GlobalInt("profile-port")
+		if c.Bool("profile") {
+			profilePort := c.Int("profile-port")
 			profileEndpoint := fmt.Sprintf("localhost:%v", profilePort)
 			go func() {
-				logrus.Debugf("starting profiling server on %v", profileEndpoint)
+				logrus.Debugf("Starting profiling server on %v", profileEndpoint)
 				if err := http.ListenAndServe(profileEndpoint, nil); err != nil {
-					logrus.Fatalf("unable to run profiling server: %v", err)
+					logrus.Fatalf("Unable to run profiling server: %v", err)
 				}
 			}()
 		}
 
-		args := c.Args()
-		if len(args) > 0 {
-			for i := range app.Commands {
-				command := &app.Commands[i]
-				if args[0] == command.Name {
-					break
-				}
-			}
+		if c.Args().Len() > 0 {
 			cancel()
-			return fmt.Errorf("command %q not supported", args[0])
+			return fmt.Errorf("command %q not supported", c.Args().Get(0))
 		}
 
 		config, ok := c.App.Metadata["config"].(*libconfig.Config)
@@ -200,14 +200,18 @@ func main() {
 		}
 
 		// Validate the configuration during runtime
-		if err := config.Validate(systemContext, true); err != nil {
+		if err := config.Validate(true); err != nil {
 			cancel()
 			return err
 		}
 
 		lis, err := server.Listen("unix", config.Listen)
 		if err != nil {
-			logrus.Fatalf("failed to listen: %v", err)
+			logrus.Fatalf("Failed to listen: %v", err)
+		}
+
+		if err := os.Chmod(config.Listen, 0o660); err != nil {
+			logrus.Fatalf("Failed to chmod listen socket %s: %v", config.Listen, err)
 		}
 
 		grpcServer := grpc.NewServer(
@@ -220,30 +224,60 @@ func main() {
 			grpc.MaxRecvMsgSize(config.GRPCMaxRecvMsgSize),
 		)
 
-		service, err := server.New(ctx, systemContext, configPath, config)
+		crioServer, err := server.New(ctx, config)
 		if err != nil {
 			logrus.Fatal(err)
 		}
 
-		// Immediately upon start up, write our new version file
-		if err := version.WriteVersionFile(config.VersionFile, gitCommit); err != nil {
+		// Immediately upon start up, write our new version files
+		// we write one to a tmpfs, so we can detect when a node rebooted.
+		// in this sitaution, we want to wipe containers
+		if err := version.WriteVersionFile(config.VersionFile); err != nil {
+			logrus.Fatal(err)
+		}
+		// we then write to a persistent directory. This is to check if crio has upgraded
+		// if it has, we should wipe images
+		if err := version.WriteVersionFile(config.VersionFilePersist); err != nil {
 			logrus.Fatal(err)
 		}
 
-		runtime.RegisterRuntimeServiceServer(grpcServer, service)
-		runtime.RegisterImageServiceServer(grpcServer, service)
+		if config.CleanShutdownFile != "" {
+			// clear out the shutdown file
+			if err := os.Remove(config.CleanShutdownFile); err != nil {
+				// not a fatal error, as it could have been cleaned up
+				logrus.Error(err)
+			}
+
+			// Write "$CleanShutdownFile".supported to show crio-wipe that
+			// we should be wiping if the CleanShutdownFile wasn't found.
+			// This protects us from wiping after an upgrade from a version that don't support
+			// CleanShutdownFile.
+			f, err := os.Create(config.CleanShutdownSupportedFileName())
+			if err != nil {
+				logrus.Errorf("Writing clean shutdown supported file: %v", err)
+			}
+			f.Close()
+
+			// and sync the changes to disk
+			if err := utils.SyncParent(config.CleanShutdownFile); err != nil {
+				logrus.Errorf("Failed to sync parent directory of clean shutdown file: %v", err)
+			}
+		}
+
+		v1alpha2.Register(grpcServer, crioServer)
+		v1.Register(grpcServer, crioServer)
 
 		// after the daemon is done setting up we can notify systemd api
 		notifySystem()
 
 		go func() {
-			service.StartExitMonitor()
+			crioServer.StartExitMonitor(ctx)
 		}()
 		hookSync := make(chan error, 2)
-		if service.ContainerServer.Hooks == nil {
+		if crioServer.ContainerServer.Hooks == nil {
 			hookSync <- err // so we don't block during cleanup
 		} else {
-			go service.ContainerServer.Hooks.Monitor(ctx, hookSync)
+			go crioServer.ContainerServer.Hooks.Monitor(ctx, hookSync)
 			err = <-hookSync
 			if err != nil {
 				cancel()
@@ -255,23 +289,23 @@ func main() {
 		grpcL := m.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
 		httpL := m.Match(cmux.HTTP1Fast())
 
-		infoMux := service.GetInfoMux()
+		infoMux := crioServer.GetInfoMux(c.Bool("enable-profile-unix-socket"))
 		httpServer := &http.Server{
 			Handler:     infoMux,
 			ReadTimeout: 5 * time.Second,
 		}
 
 		graceful := false
-		catchShutdown(ctx, cancel, grpcServer, service, httpServer, &graceful)
+		catchShutdown(ctx, cancel, grpcServer, crioServer, httpServer, &graceful)
 
 		go func() {
 			if err := grpcServer.Serve(grpcL); err != nil {
-				logrus.Errorf("unable to run GRPC server: %v", err)
+				logrus.Errorf("Unable to run GRPC server: %v", err)
 			}
 		}()
 		go func() {
 			if err := httpServer.Serve(httpL); err != nil {
-				logrus.Debugf("closed http server")
+				logrus.Debugf("Closed http server")
 			}
 		}()
 
@@ -287,31 +321,31 @@ func main() {
 			}
 		}()
 
-		streamServerCloseCh := service.StreamingServerCloseChan()
-		serverMonitorsCh := service.MonitorsCloseChan()
+		streamServerCloseCh := crioServer.StreamingServerCloseChan()
+		serverMonitorsCh := crioServer.MonitorsCloseChan()
 		select {
 		case <-streamServerCloseCh:
 		case <-serverMonitorsCh:
 		case <-serverCloseCh:
 		}
 
-		if err := service.Shutdown(ctx); err != nil {
-			logrus.Warnf("error shutting down service: %v", err)
+		if err := crioServer.Shutdown(ctx); err != nil {
+			logrus.Warnf("Error shutting down service: %v", err)
 		}
 		cancel()
 
 		<-streamServerCloseCh
-		logrus.Debug("closed stream server")
+		logrus.Debugf("Closed stream server")
 		<-serverMonitorsCh
-		logrus.Debug("closed monitors")
+		logrus.Debugf("Closed monitors")
 		err = <-hookSync
 		if err == nil || err == context.Canceled {
-			logrus.Debug("closed hook monitor")
+			logrus.Debugf("Closed hook monitor")
 		} else {
-			logrus.Errorf("hook monitor failed: %v", err)
+			logrus.Errorf("Hook monitor failed: %v", err)
 		}
 		<-serverCloseCh
-		logrus.Debug("closed main server")
+		logrus.Debugf("Closed main server")
 
 		return nil
 	}

@@ -10,23 +10,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containers/buildah/manifests"
 	"github.com/containers/buildah/pkg/blobcache"
 	"github.com/containers/buildah/util"
-	cp "github.com/containers/image/v4/copy"
-	"github.com/containers/image/v4/docker"
-	"github.com/containers/image/v4/docker/reference"
-	"github.com/containers/image/v4/manifest"
-	"github.com/containers/image/v4/signature"
-	is "github.com/containers/image/v4/storage"
-	"github.com/containers/image/v4/transports"
-	"github.com/containers/image/v4/types"
+	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/docker/reference"
+	"github.com/containers/image/v5/manifest"
+	"github.com/containers/image/v5/signature"
+	is "github.com/containers/image/v5/storage"
+	"github.com/containers/image/v5/transports"
+	"github.com/containers/image/v5/transports/alltransports"
+	"github.com/containers/image/v5/types"
+	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/stringid"
 	digest "github.com/opencontainers/go-digest"
-	configv1 "github.com/openshift/api/config/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	// BuilderIdentityAnnotation is the name of the annotation key containing
+	// the name and version of the producer of the image stored as an
+	// annotation on commit.
+	BuilderIdentityAnnotation = "io.buildah.version"
 )
 
 // CommitOptions can be used to alter how an image is committed.
@@ -73,7 +81,27 @@ type CommitOptions struct {
 	EmptyLayer bool
 	// OmitTimestamp forces epoch 0 as created timestamp to allow for
 	// deterministic, content-addressable builds.
+	// Deprecated use HistoryTimestamp instead.
 	OmitTimestamp bool
+	// SignBy is the fingerprint of a GPG key to use for signing the image.
+	SignBy string
+	// Manifest list to add the image to.
+	Manifest string
+	// MaxRetries is the maximum number of attempts we'll make to commit
+	// the image to an external registry if the first attempt fails.
+	MaxRetries int
+	// RetryDelay is how long to wait before retrying a commit attempt to a
+	// registry.
+	RetryDelay time.Duration
+	// OciEncryptConfig when non-nil indicates that an image should be encrypted.
+	// The encryption options is derived from the construction of EncryptConfig object.
+	OciEncryptConfig *encconfig.EncryptConfig
+	// OciEncryptLayers represents the list of layers to encrypt.
+	// If nil, don't encrypt any layers.
+	// If non-nil and len==0, denotes encrypt all layers.
+	// integers in the slice represent 0-indexed layer indices, with support for negative
+	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
+	OciEncryptLayers *[]int
 }
 
 // PushOptions can be used to alter how an image is copied somewhere.
@@ -96,7 +124,7 @@ type PushOptions struct {
 	// github.com/containers/image/types SystemContext to hold credentials
 	// and other authentication/authorization information.
 	SystemContext *types.SystemContext
-	// ManifestType is the format to use when saving the imge using the 'dir' transport
+	// ManifestType is the format to use when saving the image using the 'dir' transport
 	// possible options are oci, v2s1, and v2s2
 	ManifestType string
 	// BlobDirectory is the name of a directory in which we'll look for
@@ -108,6 +136,25 @@ type PushOptions struct {
 	// the user will be displayed, this is best used for logging.
 	// The default is false.
 	Quiet bool
+	// SignBy is the fingerprint of a GPG key to use for signing the image.
+	SignBy string
+	// RemoveSignatures causes any existing signatures for the image to be
+	// discarded for the pushed copy.
+	RemoveSignatures bool
+	// MaxRetries is the maximum number of attempts we'll make to push any
+	// one image to the external registry if the first attempt fails.
+	MaxRetries int
+	// RetryDelay is how long to wait before retrying a push attempt.
+	RetryDelay time.Duration
+	// OciEncryptConfig when non-nil indicates that an image should be encrypted.
+	// The encryption options is derived from the construction of EncryptConfig object.
+	OciEncryptConfig *encconfig.EncryptConfig
+	// OciEncryptLayers represents the list of layers to encrypt.
+	// If nil, don't encrypt any layers.
+	// If non-nil and len==0, denotes encrypt all layers.
+	// integers in the slice represent 0-indexed layer indices, with support for negative
+	// indexing. i.e. 0 is the first layer, -1 is the last (top-most) layer.
+	OciEncryptLayers *[]int
 }
 
 var (
@@ -124,23 +171,28 @@ var (
 // variable, if it's set.  The contents are expected to be a JSON-encoded
 // github.com/openshift/api/config/v1.Image, set by an OpenShift build
 // controller that arranged for us to be run in a container.
-func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error {
+func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) (insecure bool, err error) {
 	transport := dest.Transport()
 	if transport == nil {
-		return nil
+		return false, nil
 	}
 	if transport.Name() != docker.Transport.Name() {
-		return nil
+		return false, nil
 	}
 	dref := dest.DockerReference()
 	if dref == nil || reference.Domain(dref) == "" {
-		return nil
+		return false, nil
 	}
 
 	if registrySources, ok := os.LookupEnv("BUILD_REGISTRY_SOURCES"); ok && len(registrySources) > 0 {
-		var sources configv1.RegistrySources
+		// Use local struct instead of github.com/openshift/api/config/v1 RegistrySources
+		var sources struct {
+			InsecureRegistries []string `json:"insecureRegistries,omitempty"`
+			BlockedRegistries  []string `json:"blockedRegistries,omitempty"`
+			AllowedRegistries  []string `json:"allowedRegistries,omitempty"`
+		}
 		if err := json.Unmarshal([]byte(registrySources), &sources); err != nil {
-			return errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
+			return false, errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
 		}
 		blocked := false
 		if len(sources.BlockedRegistries) > 0 {
@@ -151,7 +203,7 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 			}
 		}
 		if blocked {
-			return errors.Errorf("%s registry at %q denied by policy: it is in the blocked registries list", forWhat, reference.Domain(dref))
+			return false, errors.Errorf("%s registry at %q denied by policy: it is in the blocked registries list", forWhat, reference.Domain(dref))
 		}
 		allowed := true
 		if len(sources.AllowedRegistries) > 0 {
@@ -163,10 +215,55 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 			}
 		}
 		if !allowed {
-			return errors.Errorf("%s registry at %q denied by policy: not in allowed registries list", forWhat, reference.Domain(dref))
+			return false, errors.Errorf("%s registry at %q denied by policy: not in allowed registries list", forWhat, reference.Domain(dref))
+		}
+		if len(sources.InsecureRegistries) > 0 {
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
+}
+
+func (b *Builder) addManifest(ctx context.Context, manifestName string, imageSpec string) (string, error) {
+	var create bool
+	systemContext := &types.SystemContext{}
+	var list manifests.List
+	_, listImage, err := util.FindImage(b.store, "", systemContext, manifestName)
+	if err != nil {
+		create = true
+		list = manifests.Create()
+	} else {
+		_, list, err = manifests.LoadFromImage(b.store, listImage.ID)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	names, err := util.ExpandNames([]string{manifestName}, "", systemContext, b.store)
+	if err != nil {
+		return "", errors.Wrapf(err, "error encountered while expanding image name %q", manifestName)
+	}
+
+	ref, err := alltransports.ParseImageName(imageSpec)
+	if err != nil {
+		if ref, err = alltransports.ParseImageName(util.DefaultTransport + imageSpec); err != nil {
+			// check if the local image exists
+			if ref, _, err = util.FindImage(b.store, "", systemContext, imageSpec); err != nil {
+				return "", err
+			}
+		}
+	}
+
+	if _, err = list.Add(ctx, systemContext, ref, true); err != nil {
+		return "", err
+	}
+	var imageID string
+	if create {
+		imageID, err = list.SaveToImage(b.store, "", names, manifest.DockerV2ListMediaType)
+	} else {
+		imageID, err = list.SaveToImage(b.store, listImage.ID, nil, "")
+	}
+	return imageID, err
 }
 
 // Commit writes the contents of the container, along with its updated
@@ -174,7 +271,9 @@ func checkRegistrySourcesAllows(forWhat string, dest types.ImageReference) error
 // add any additional tags that were specified. Returns the ID of the new image
 // if commit was successful and the image destination was local.
 func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options CommitOptions) (string, reference.Canonical, digest.Digest, error) {
-	var imgID string
+	var (
+		imgID string
+	)
 
 	// If we weren't given a name, build a destination reference using a
 	// temporary name that we'll remove later.  The correct thing to do
@@ -184,6 +283,13 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	// want to compute here because we'll have to do it again when
 	// cp.Image() instantiates a source image, and we don't want to do the
 	// work twice.
+	if options.OmitTimestamp {
+		if options.HistoryTimestamp != nil {
+			return imgID, nil, "", errors.Errorf("OmitTimestamp ahd HistoryTimestamp can not be used together")
+		}
+		timestamp := time.Unix(0, 0).UTC()
+		options.HistoryTimestamp = &timestamp
+	}
 	nameToRemove := ""
 	if dest == nil {
 		nameToRemove = stringid.GenerateRandomID() + "-tmp"
@@ -223,8 +329,17 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	}()
 
 	// Check if the commit is blocked by $BUILDER_REGISTRY_SOURCES.
-	if err := checkRegistrySourcesAllows("commit to", dest); err != nil {
+	insecure, err := checkRegistrySourcesAllows("commit to", dest)
+	if err != nil {
 		return imgID, nil, "", err
+	}
+	if insecure {
+		if systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
+			return imgID, nil, "", errors.Errorf("can't require tls verification on an insecured registry")
+		}
+		systemContext.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+		systemContext.OCIInsecureSkipTLSVerify = true
+		systemContext.DockerDaemonInsecureSkipTLSVerify = true
 	}
 	if len(options.AdditionalTags) > 0 {
 		names, err := util.ExpandNames(options.AdditionalTags, "", systemContext, b.store)
@@ -236,8 +351,17 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 			if err != nil {
 				return imgID, nil, "", errors.Wrapf(err, "error parsing image name %q as an image reference", name)
 			}
-			if err := checkRegistrySourcesAllows("commit to", additionalDest); err != nil {
+			insecure, err := checkRegistrySourcesAllows("commit to", additionalDest)
+			if err != nil {
 				return imgID, nil, "", err
+			}
+			if insecure {
+				if systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
+					return imgID, nil, "", errors.Errorf("can't require tls verification on an insecured registry")
+				}
+				systemContext.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+				systemContext.OCIInsecureSkipTLSVerify = true
+				systemContext.DockerDaemonInsecureSkipTLSVerify = true
 			}
 		}
 	}
@@ -246,7 +370,9 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	// Check if the base image is already in the destination and it's some kind of local
 	// storage.  If so, we can skip recompressing any layers that come from the base image.
 	exportBaseLayers := true
-	if transport, destIsStorage := dest.Transport().(is.StoreTransport); destIsStorage && b.FromImageID != "" {
+	if transport, destIsStorage := dest.Transport().(is.StoreTransport); destIsStorage && options.OciEncryptConfig != nil {
+		return imgID, nil, "", errors.New("unable to use local storage with image encryption")
+	} else if destIsStorage && b.FromImageID != "" {
 		if baseref, err := transport.ParseReference(b.FromImageID); baseref != nil && err == nil {
 			if img, err := transport.GetImage(baseref); img != nil && err == nil {
 				logrus.Debugf("base image %q is already present in local storage, no need to copy its layers", b.FromImageID)
@@ -286,8 +412,16 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	case archive.Gzip:
 		systemContext.DirForceCompress = true
 	}
+
+	if systemContext.ArchitectureChoice != b.Architecture() {
+		systemContext.ArchitectureChoice = b.Architecture()
+	}
+	if systemContext.OSChoice != b.OS() {
+		systemContext.OSChoice = b.OS()
+	}
+
 	var manifestBytes []byte
-	if manifestBytes, err = cp.Image(ctx, policyContext, maybeCachedDest, maybeCachedSrc, getCopyOptions(b.store, options.ReportWriter, nil, systemContext, "")); err != nil {
+	if manifestBytes, err = retryCopyImage(ctx, policyContext, maybeCachedDest, maybeCachedSrc, dest, getCopyOptions(b.store, options.ReportWriter, nil, systemContext, "", false, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
 		return imgID, nil, "", errors.Wrapf(err, "error copying layers and metadata for container %q", b.ContainerID)
 	}
 	// If we've got more names to attach, and we know how to do that for
@@ -309,7 +443,7 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 	}
 
 	img, err := is.Transport.GetStoreImage(b.store, dest)
-	if err != nil && err != storage.ErrImageUnknown {
+	if err != nil && errors.Cause(err) != storage.ErrImageUnknown {
 		return imgID, nil, "", errors.Wrapf(err, "error locating image %q in local storage", transports.ImageName(dest))
 	}
 	if err == nil {
@@ -332,8 +466,8 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 			dest = dest2
 		}
 		if options.IIDFile != "" {
-			if err = ioutil.WriteFile(options.IIDFile, []byte(img.ID), 0644); err != nil {
-				return imgID, nil, "", errors.Wrapf(err, "failed to write image ID to file %q", options.IIDFile)
+			if err = ioutil.WriteFile(options.IIDFile, []byte("sha256:"+img.ID), 0644); err != nil {
+				return imgID, nil, "", err
 			}
 		}
 	}
@@ -351,6 +485,14 @@ func (b *Builder) Commit(ctx context.Context, dest types.ImageReference, options
 		}
 	}
 
+	if options.Manifest != "" {
+		manifestID, err := b.addManifest(ctx, options.Manifest, imgID)
+		if err != nil {
+			return imgID, nil, "", err
+		}
+		logrus.Debugf("added imgID %s to manifestID %s", imgID, manifestID)
+
+	}
 	return imgID, ref, manifestDigest, nil
 }
 
@@ -406,8 +548,17 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 	}
 
 	// Check if the push is blocked by $BUILDER_REGISTRY_SOURCES.
-	if err := checkRegistrySourcesAllows("push to", dest); err != nil {
+	insecure, err := checkRegistrySourcesAllows("push to", dest)
+	if err != nil {
 		return nil, "", err
+	}
+	if insecure {
+		if systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
+			return nil, "", errors.Errorf("can't require tls verification on an insecured registry")
+		}
+		systemContext.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+		systemContext.OCIInsecureSkipTLSVerify = true
+		systemContext.DockerDaemonInsecureSkipTLSVerify = true
 	}
 	logrus.Debugf("pushing image to reference %q is allowed by policy", transports.ImageName(dest))
 
@@ -419,7 +570,7 @@ func Push(ctx context.Context, image string, dest types.ImageReference, options 
 		systemContext.DirForceCompress = true
 	}
 	var manifestBytes []byte
-	if manifestBytes, err = cp.Image(ctx, policyContext, dest, maybeCachedSrc, getCopyOptions(options.Store, options.ReportWriter, nil, systemContext, options.ManifestType)); err != nil {
+	if manifestBytes, err = retryCopyImage(ctx, policyContext, dest, maybeCachedSrc, dest, getCopyOptions(options.Store, options.ReportWriter, nil, systemContext, options.ManifestType, options.RemoveSignatures, options.SignBy, options.OciEncryptLayers, options.OciEncryptConfig, nil), options.MaxRetries, options.RetryDelay); err != nil {
 		return nil, "", errors.Wrapf(err, "error copying layers and metadata from %q to %q", transports.ImageName(maybeCachedSrc), transports.ImageName(dest))
 	}
 	if options.ReportWriter != nil {

@@ -1,16 +1,14 @@
 package sandbox_test
 
 import (
-	"os"
 	"time"
 
+	"github.com/cri-o/cri-o/internal/hostport"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/golang/mock/gomock"
+	"github.com/cri-o/cri-o/server/cri/types"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
 )
 
 // The actual test suite
@@ -30,7 +28,7 @@ var _ = t.Describe("Sandbox", func() {
 			annotations := map[string]string{"a": "annotA", "b": "annotB"}
 			processLabel := "processLabel"
 			mountLabel := "mountLabel"
-			metadata := pb.PodSandboxMetadata{Name: name}
+			metadata := sandbox.Metadata{Name: name}
 			shmPath := "shmPath"
 			cgroupParent := "cgroupParent"
 			privileged := true
@@ -39,12 +37,13 @@ var _ = t.Describe("Sandbox", func() {
 			hostname := "hostname"
 			portMappings := []*hostport.PortMapping{{}, {}}
 			hostNetwork := false
+			createdAt := time.Now()
 
 			// When
 			sandbox, err := sandbox.New(id, namespace, name, kubeName, logDir,
 				labels, annotations, processLabel, mountLabel, &metadata,
 				shmPath, cgroupParent, privileged, runtimeHandler,
-				resolvPath, hostname, portMappings, hostNetwork)
+				resolvPath, hostname, portMappings, hostNetwork, createdAt, "")
 
 			// Then
 			Expect(err).To(BeNil())
@@ -69,7 +68,7 @@ var _ = t.Describe("Sandbox", func() {
 			Expect(sandbox.HostNetwork()).To(Equal(hostNetwork))
 			Expect(sandbox.StopMutex()).NotTo(BeNil())
 			Expect(sandbox.Containers()).NotTo(BeNil())
-			Expect(sandbox.NetNs()).To(BeNil())
+			Expect(sandbox.CreatedAt()).To(Equal(createdAt))
 		})
 	})
 
@@ -107,10 +106,23 @@ var _ = t.Describe("Sandbox", func() {
 			Expect(testSandbox.Stopped()).To(BeFalse())
 
 			// When
-			testSandbox.SetStopped()
+			testSandbox.SetStopped(false)
 
 			// Then
 			Expect(testSandbox.Stopped()).To(BeTrue())
+		})
+	})
+
+	t.Describe("NetworkStopped", func() {
+		It("should succeed", func() {
+			// Given
+			Expect(testSandbox.NetworkStopped()).To(BeFalse())
+
+			// When
+			Expect(testSandbox.SetNetworkStopped(false)).To(BeNil())
+
+			// Then
+			Expect(testSandbox.NetworkStopped()).To(BeTrue())
 		})
 	})
 
@@ -144,7 +156,7 @@ var _ = t.Describe("Sandbox", func() {
 	t.Describe("SetNamespaceOptions", func() {
 		It("should succeed", func() {
 			// Given
-			newNamespaceOption := &pb.NamespaceOption{
+			newNamespaceOption := &types.NamespaceOption{
 				Network: 1,
 				Pid:     2,
 				Ipc:     3,
@@ -161,7 +173,6 @@ var _ = t.Describe("Sandbox", func() {
 				To(Equal(newNamespaceOption.Pid))
 			Expect(testSandbox.NamespaceOptions().Ipc).
 				To(Equal(newNamespaceOption.Ipc))
-
 		})
 	})
 
@@ -171,14 +182,13 @@ var _ = t.Describe("Sandbox", func() {
 		BeforeEach(func() {
 			var err error
 			testContainer, err = oci.NewContainer("testid", "testname", "",
-				"/container/logs", "", map[string]string{},
+				"/container/logs", map[string]string{},
 				map[string]string{}, map[string]string{}, "image",
-				"imageName", "imageRef", &pb.ContainerMetadata{},
-				"testsandboxid", false, false, false, false, "",
+				"imageName", "imageRef", &oci.Metadata{},
+				"testsandboxid", false, false, false, "",
 				"/root/for/container", time.Now(), "SIGKILL")
 			Expect(err).To(BeNil())
 			Expect(testContainer).NotTo(BeNil())
-
 		})
 
 		It("should succeed to add and remove a container", func() {
@@ -209,8 +219,11 @@ var _ = t.Describe("Sandbox", func() {
 			// Then
 			Expect(err).To(BeNil())
 			Expect(testSandbox.InfraContainer()).To(Equal(testContainer))
-			Expect(testSandbox.UserNsPath()).NotTo(Equal(""))
-			Expect(testSandbox.NetNsPath()).NotTo(Equal(""))
+			// while we have a sandbox, it does not have any valid namespaces
+			Expect(testSandbox.UserNsPath()).To(Equal(""))
+			Expect(testSandbox.NetNsPath()).To(Equal(""))
+			Expect(testSandbox.UtsNsPath()).To(Equal(""))
+			Expect(testSandbox.IpcNsPath()).To(Equal(""))
 
 			// And When
 			testSandbox.RemoveInfraContainer()
@@ -219,6 +232,8 @@ var _ = t.Describe("Sandbox", func() {
 			Expect(testSandbox.InfraContainer()).To(BeNil())
 			Expect(testSandbox.UserNsPath()).To(Equal(""))
 			Expect(testSandbox.NetNsPath()).To(Equal(""))
+			Expect(testSandbox.UtsNsPath()).To(Equal(""))
+			Expect(testSandbox.IpcNsPath()).To(Equal(""))
 		})
 
 		It("should fail add an infra container twice", func() {
@@ -242,207 +257,61 @@ var _ = t.Describe("Sandbox", func() {
 			Expect(err).NotTo(BeNil())
 		})
 	})
-
-	t.Describe("NetNsRemove", func() {
-		It("should succeed when netns nil", func() {
+	t.Describe("NeedsInfra", func() {
+		It("should not need when managing NS and NS mode NODE", func() {
 			// Given
-			// When
-			err := testSandbox.NetNsRemove()
-
-			// Then
-			Expect(err).To(BeNil())
-		})
-	})
-
-	t.Describe("NetNsJoin", func() {
-		It("should fail when network namespace not exists", func() {
-			// Given
-			// When
-			err := testSandbox.NetNsJoin("path", "name")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-	})
-
-	t.Describe("NetNsCreate", func() {
-		It("should succeed", func() {
-			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(false),
-				netNsIfaceMock.EXPECT().Initialize().Return(netNsIfaceMock, nil),
-				netNsIfaceMock.EXPECT().SymlinkCreate(gomock.Any()).Return(nil),
-				netNsIfaceMock.EXPECT().Remove().Return(nil),
-			)
+			manageNS := true
+			newNamespaceOption := &types.NamespaceOption{
+				Pid: types.NamespaceModeNODE,
+			}
 
 			// When
-			err := testSandbox.NetNsCreate(netNsIfaceMock)
+			testSandbox.SetNamespaceOptions(newNamespaceOption)
 
 			// Then
-			Expect(err).To(BeNil())
-			Expect(testSandbox.NetNsRemove()).To(BeNil())
+			Expect(testSandbox.NeedsInfra(manageNS)).To(Equal(false))
 		})
 
-		It("should not crash when parameter is nil", func() {
+		It("should not need when managing NS and NS mode CONTAINER", func() {
 			// Given
-			// When
-			_ = testSandbox.NetNsCreate(nil) // nolint: errcheck
-
-			// Then
-		})
-
-		It("should fail on failed symlink creation", func() {
-			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(false),
-				netNsIfaceMock.EXPECT().Initialize().
-					Return(netNsIfaceMock, nil),
-				netNsIfaceMock.EXPECT().SymlinkCreate(gomock.Any()).
-					Return(t.TestError),
-				netNsIfaceMock.EXPECT().Close().Return(nil),
-			)
+			manageNS := true
+			newNamespaceOption := &types.NamespaceOption{
+				Pid: types.NamespaceModeCONTAINER,
+			}
 
 			// When
-			err := testSandbox.NetNsCreate(netNsIfaceMock)
+			testSandbox.SetNamespaceOptions(newNamespaceOption)
 
 			// Then
-			Expect(err).NotTo(BeNil())
+			Expect(testSandbox.NeedsInfra(manageNS)).To(Equal(false))
 		})
 
-		It("should fail on failed symlink creation (with close error)", func() {
+		It("should need when namespace mode POD", func() {
 			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(false),
-				netNsIfaceMock.EXPECT().Initialize().
-					Return(netNsIfaceMock, nil),
-				netNsIfaceMock.EXPECT().SymlinkCreate(gomock.Any()).
-					Return(t.TestError),
-				netNsIfaceMock.EXPECT().Close().Return(t.TestError),
-			)
+			manageNS := false
+			newNamespaceOption := &types.NamespaceOption{
+				Pid: types.NamespaceModePOD,
+			}
 
 			// When
-			err := testSandbox.NetNsCreate(netNsIfaceMock)
+			testSandbox.SetNamespaceOptions(newNamespaceOption)
 
 			// Then
-			Expect(err).NotTo(BeNil())
+			Expect(testSandbox.NeedsInfra(manageNS)).To(Equal(true))
 		})
 
-		It("should fail on initialization error", func() {
+		It("should need when not managing NS", func() {
 			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(false),
-				netNsIfaceMock.EXPECT().Initialize().
-					Return(nil, t.TestError),
-			)
+			manageNS := true
+			newNamespaceOption := &types.NamespaceOption{
+				Pid: types.NamespaceModeCONTAINER,
+			}
 
 			// When
-			err := testSandbox.NetNsCreate(netNsIfaceMock)
+			testSandbox.SetNamespaceOptions(newNamespaceOption)
 
 			// Then
-			Expect(err).NotTo(BeNil())
-		})
-
-		It("should fail when already initialized", func() {
-			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(true),
-			)
-
-			// When
-			err := testSandbox.NetNsCreate(netNsIfaceMock)
-
-			// Then
-			Expect(err).NotTo(BeNil())
-		})
-	})
-
-	t.Describe("HostNetNsPath", func() {
-		It("should succeed", func() {
-			// Given
-			// When
-			hostnet, err := sandbox.HostNetNsPath()
-
-			// Then
-			Expect(err).To(BeNil())
-			Expect(hostnet).NotTo(BeNil())
-		})
-	})
-
-	t.Describe("NetNsGet", func() {
-		BeforeEach(func() {
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Initialized().Return(false),
-				netNsIfaceMock.EXPECT().Initialize().
-					Return(netNsIfaceMock, nil),
-				netNsIfaceMock.EXPECT().SymlinkCreate(gomock.Any()).
-					Return(nil),
-			)
-			Expect(testSandbox.NetNsCreate(netNsIfaceMock)).To(BeNil())
-		})
-
-		It("should succeed", func() {
-			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Get().Return(&sandbox.NetNs{}),
-			)
-			// When
-			ns, err := testSandbox.NetNsGet("/proc/self/ns",
-				"../../../tmp/test")
-
-			// Then
-			defer os.RemoveAll(ns.Path())
-			Expect(err).To(BeNil())
-			Expect(ns).NotTo(BeNil())
-			Expect(testSandbox.NetNs()).NotTo(BeNil())
-			Expect(testSandbox.NetNsJoin("/proc/self/ns", ns.Path())).
-				NotTo(BeNil())
-			Expect(ns.Close()).To(BeNil())
-			Expect(ns.Remove()).NotTo(BeNil())
-		})
-
-		It("should succeed with symlink", func() {
-			// Given
-			gomock.InOrder(
-				netNsIfaceMock.EXPECT().Get().Return(&sandbox.NetNs{}),
-			)
-			const link = "ns-link"
-			Expect(os.Symlink("/proc/self/ns", link)).To(BeNil())
-			defer os.RemoveAll(link)
-
-			// When
-			ns, err := testSandbox.NetNsGet(link, "../../../tmp/test")
-
-			// Then
-			defer os.RemoveAll(ns.Path())
-			Expect(err).To(BeNil())
-			Expect(ns).NotTo(BeNil())
-			Expect(testSandbox.NetNs()).NotTo(BeNil())
-			Expect(ns.Remove()).NotTo(BeNil())
-		})
-
-		It("should fail on invalid namespace", func() {
-			// Given
-
-			// When
-			ns, err := testSandbox.NetNsGet("", "")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(ns).To(BeNil())
-		})
-
-		It("should fail on invalid permissions", func() {
-			// Given
-			Expect(os.MkdirAll("/tmp/noperm", 0000)).To(BeNil())
-			defer os.RemoveAll("/tmp/noperm")
-
-			// When
-			ns, err := testSandbox.NetNsGet("/proc/self/ns",
-				"../../../tmp/noperm/test")
-
-			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(ns).To(BeNil())
+			Expect(testSandbox.NeedsInfra(manageNS)).To(Equal(false))
 		})
 	})
 })

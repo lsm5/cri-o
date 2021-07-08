@@ -4,7 +4,13 @@ load helpers
 
 IMAGE=quay.io/crio/pause
 SIGNED_IMAGE=registry.access.redhat.com/rhel7-atomic:latest
-UNSIGNED_IMAGE=quay.io/crio/hello-world:latest
+
+IMAGE_LIST_TAG=docker.io/library/alpine:3.9
+IMAGE_LIST_DIGEST_FOR_TAG=docker.io/library/alpine@sha256:414e0518bb9228d35e4cd5165567fb91d26c6a214e9c95899e1e056fcd349011
+IMAGE_LIST_DIGEST_FOR_TAG_AMD64=docker.io/library/alpine@sha256:65b3a80ebe7471beecbc090c5b2cdd0aafeaefa0715f8f12e40dc918a3a70e32
+
+IMAGE_LIST_DIGEST_AMD64=docker.io/library/alpine@sha256:ab3fe83c0696e3f565c9b4a734ec309ae9bd0d74c192de4590fd6dc2ef717815
+IMAGE_LIST_DIGEST=docker.io/library/alpine@sha256:ab3fe83c0696e3f565c9b4a734ec309ae9bd0d74c192de4590fd6dc2ef717815
 
 function setup() {
 	setup_test
@@ -16,253 +22,282 @@ function teardown() {
 
 @test "run container in pod with image ID" {
 	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
-	sed -e "s/%VALUE%/$REDIS_IMAGEID/g" "$TESTDATA"/container_config_by_imageid.json > "$TESTDIR"/ctr_by_imageid.json
-	run crictl create "$pod_id" "$TESTDIR"/ctr_by_imageid.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	ctr_id="$output"
-	run crictl start "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
+	jq '.image.image = "'"$REDIS_IMAGEID"'"' \
+		"$TESTDATA"/container_config.json > "$TESTDIR"/ctr.json
+	ctr_id=$(crictl create --no-pull "$pod_id" "$TESTDIR"/ctr.json "$TESTDATA"/sandbox_config.json)
+	crictl start "$ctr_id"
 }
 
 @test "container status when created by image ID" {
 	start_crio
 
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
 
-	sed -e "s/%VALUE%/$REDIS_IMAGEID/g" "$TESTDATA"/container_config_by_imageid.json > "$TESTDIR"/ctr_by_imageid.json
+	jq '.image.image = "'"$REDIS_IMAGEID"'"' \
+		"$TESTDATA"/container_config.json > "$TESTDIR"/ctr.json
+	ctr_id=$(crictl create --no-pull "$pod_id" "$TESTDIR"/ctr.json "$TESTDATA"/sandbox_config.json)
 
-	run crictl create "$pod_id" "$TESTDIR"/ctr_by_imageid.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	ctr_id="$output"
-
-	run crictl inspect "$ctr_id" --output yaml
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
-	[[ "$output" =~ "imageRef: $REDIS_IMAGEREF" ]]
+	output=$(crictl inspect -o yaml "$ctr_id")
+	[[ "$output" == *"image: quay.io/crio/redis:alpine"* ]]
+	[[ "$output" == *"imageRef: $REDIS_IMAGEREF"* ]]
 }
 
 @test "container status when created by image tagged reference" {
 	start_crio
 
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
 
-	sed -e "s/%VALUE%/quay.io\/crio\/redis:alpine/g" "$TESTDATA"/container_config_by_imageid.json > "$TESTDIR"/ctr_by_imagetag.json
+	jq '.image.image = "quay.io/crio/redis:alpine"' \
+		"$TESTDATA"/container_config.json > "$TESTDIR"/ctr.json
 
-	run crictl create "$pod_id" "$TESTDIR"/ctr_by_imagetag.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	ctr_id="$output"
+	ctr_id=$(crictl create "$pod_id" "$TESTDIR"/ctr.json "$TESTDATA"/sandbox_config.json)
 
-	run crictl inspect "$ctr_id" --output yaml
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
-	[[ "$output" =~ "imageRef: $REDIS_IMAGEREF" ]]
+	output=$(crictl inspect -o yaml "$ctr_id")
+	[[ "$output" == *"image: quay.io/crio/redis:alpine"* ]]
+	[[ "$output" == *"imageRef: $REDIS_IMAGEREF"* ]]
 }
 
 @test "container status when created by image canonical reference" {
 	start_crio
 
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
 
-	sed -e "s|%VALUE%|$REDIS_IMAGEREF|g" "$TESTDATA"/container_config_by_imageid.json > "$TESTDIR"/ctr_by_imageref.json
+	jq '.image.image = "'"$REDIS_IMAGEREF"'"' \
+		"$TESTDATA"/container_config.json > "$TESTDIR"/ctr.json
 
-	run crictl create "$pod_id" "$TESTDIR"/ctr_by_imageref.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	ctr_id="$output"
+	ctr_id=$(crictl create "$pod_id" "$TESTDIR"/ctr.json "$TESTDATA"/sandbox_config.json)
 
-	run crictl start "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	crictl start "$ctr_id"
+	output=$(crictl inspect -o yaml "$ctr_id")
+	[[ "$output" == *"image: quay.io/crio/redis:alpine"* ]]
+	[[ "$output" == *"imageRef: $REDIS_IMAGEREF"* ]]
+}
 
-	run crictl inspect "$ctr_id" --output yaml
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "image: quay.io/crio/redis:alpine" ]]
-	[[ "$output" =~ "imageRef: $REDIS_IMAGEREF" ]]
+@test "container status when created by image list canonical reference" {
+	start_crio
+
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
+	crictl pull "$IMAGE_LIST_DIGEST"
+
+	jq '.image.image = "'"$IMAGE_LIST_DIGEST"'"' \
+		"$TESTDATA"/container_config.json > "$TESTDIR"/ctr.json
+
+	ctr_id=$(crictl create "$pod_id" "$TESTDIR"/ctr.json "$TESTDATA"/sandbox_config.json)
+
+	crictl start "$ctr_id"
+	output=$(crictl inspect -o yaml "$ctr_id")
+	[[ "$output" == *"image: $IMAGE_LIST_DIGEST"* ]]
+	[[ "$output" == *"imageRef: $IMAGE_LIST_DIGEST"* ]]
 }
 
 @test "image pull and list" {
-	start_crio "" "" --no-pause-image
-	run crictl pull "$IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	start_crio
+	crictl pull "$IMAGE"
+	imageid=$(crictl images --quiet "$IMAGE")
+	[ "$imageid" != "" ]
 
-	run crictl images --quiet "$IMAGE"
-	[ "$status" -eq 0 ]
-	echo "$output"
-	[ "$output" != "" ]
-	imageid="$output"
+	output=$(crictl images @"$imageid")
+	[[ "$output" == *"$IMAGE"* ]]
 
-	run crictl images @"$imageid"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "$IMAGE" ]]
-
-	run crictl images --quiet "$imageid"
-	[ "$status" -eq 0 ]
-	echo "$output"
+	output=$(crictl images --quiet "$imageid")
 	[ "$output" != "" ]
 	cleanup_images
 }
 
 @test "image pull with signature" {
 	skip "registry has some issues"
-	start_crio "" "" --no-pause-image
-	run crictl pull "$SIGNED_IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	cleanup_images
-}
-
-@test "image pull without signature" {
-	start_crio "" "" --no-pause-image
-	run crictl image pull "$UNSIGNED_IMAGE"
-	echo "$output"
-	[ "$status" -ne 0 ]
+	start_crio
+	crictl pull "$SIGNED_IMAGE"
 	cleanup_images
 }
 
 @test "image pull and list by tag and ID" {
-	start_crio "" "" --no-pause-image
-	run crictl pull "$IMAGE:go"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	start_crio
+	crictl pull "$IMAGE:go"
 
-	run crictl images --quiet "$IMAGE:go"
-	[ "$status" -eq 0 ]
-	echo "$output"
-	[ "$output" != "" ]
-	imageid="$output"
+	imageid=$(crictl images --quiet "$IMAGE:go")
+	[ "$imageid" != "" ]
 
-	run crictl images --quiet @"$imageid"
-	[ "$status" -eq 0 ]
-	echo "$output"
+	output=$(crictl images --quiet @"$imageid")
 	[ "$output" != "" ]
 
-	run crictl images --quiet "$imageid"
-	[ "$status" -eq 0 ]
-	echo "$output"
+	output=$(crictl images --quiet "$imageid")
 	[ "$output" != "" ]
 
 	cleanup_images
 }
 
 @test "image pull and list by digest and ID" {
-	start_crio "" "" --no-pause-image
-	run crictl pull quay.io/crio/nginx@sha256:1ad874092a55efe2be0507a01d8a300e286f8137510854606ab1dd28861507a3
-	echo "$output"
-	[ "$status" -eq 0 ]
+	start_crio
+	crictl pull quay.io/crio/nginx@sha256:1ad874092a55efe2be0507a01d8a300e286f8137510854606ab1dd28861507a3
 
-	run crictl images --quiet quay.io/crio/nginx@sha256:1ad874092a55efe2be0507a01d8a300e286f8137510854606ab1dd28861507a3
-	[ "$status" -eq 0 ]
-	echo "$output"
-	[ "$output" != "" ]
-	imageid="$output"
-
-	run crictl images --quiet @"$imageid"
-	[ "$status" -eq 0 ]
-	echo "$output"
+	imageid=$(crictl images --quiet quay.io/crio/nginx@sha256:1ad874092a55efe2be0507a01d8a300e286f8137510854606ab1dd28861507a3)
+	[ "$imageid" != "" ]
+	output=$(crictl images --quiet @"$imageid")
 	[ "$output" != "" ]
 
-	run crictl images --quiet "$imageid"
-	[ "$status" -eq 0 ]
-	echo "$output"
+	output=$(crictl images --quiet "$imageid")
+	[ "$output" != "" ]
+
+	cleanup_images
+}
+
+@test "image pull and list by manifest list digest" {
+	start_crio
+
+	crictl pull ${IMAGE_LIST_DIGEST}
+
+	imageid=$(crictl images --quiet ${IMAGE_LIST_DIGEST})
+	[ "$imageid" != "" ]
+
+	output=$(crictl images -v ${IMAGE_LIST_DIGEST})
+	[ "$output" != "" ]
+	[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST}"* ]]
+
+	case $(go env GOARCH) in
+	amd64)
+		output=$(crictl images -v ${IMAGE_LIST_DIGEST_AMD64})
+		[ "$output" != "" ]
+		[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST_AMD64}"* ]]
+		;;
+	esac
+
+	output=$(crictl images --quiet @"$imageid")
+	[ "$output" != "" ]
+
+	output=$(crictl images --quiet "$imageid")
+	[ "$output" != "" ]
+
+	cleanup_images
+}
+
+@test "image pull and list by manifest list tag" {
+	start_crio
+
+	crictl pull ${IMAGE_LIST_TAG}
+	imageid=$(crictl images --quiet ${IMAGE_LIST_TAG})
+	[ "$imageid" != "" ]
+
+	output=$(crictl images -v ${IMAGE_LIST_DIGEST_FOR_TAG})
+	if [ "$output" == "" ]; then
+		echo "NOTE: THIS TEST PROBABLY FAILED BECAUSE DIGEST HAS CHANGED, CONSIDER UPDATING TO MATCH THE FOLLOWING DIGEST:"
+		crictl inspecti ${IMAGE_LIST_TAG} | jq .status.repoDigests
+		echo "$output"
+		exit 1
+	fi
+	[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST_FOR_TAG}"* ]]
+
+	case $(go env GOARCH) in
+	amd64)
+		output=$(crictl images -v ${IMAGE_LIST_DIGEST_FOR_TAG_AMD64})
+		[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST_FOR_TAG_AMD64}"* ]]
+		;;
+	esac
+
+	output=$(crictl images --quiet @"$imageid")
+	[ "$output" != "" ]
+
+	output=$(crictl images --quiet "$imageid")
+	[ "$output" != "" ]
+
+	cleanup_images
+}
+
+@test "image pull and list by manifest list and individual digest" {
+	start_crio
+
+	crictl pull ${IMAGE_LIST_DIGEST}
+	imageid=$(crictl images --quiet ${IMAGE_LIST_DIGEST})
+	[ "$imageid" != "" ]
+
+	case $(go env GOARCH) in
+	amd64)
+		crictl pull ${IMAGE_LIST_DIGEST_AMD64}
+		output=$(crictl images -v ${IMAGE_LIST_DIGEST_AMD64})
+		[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST_AMD64}"* ]]
+		;;
+	esac
+
+	output=$(crictl images -v ${IMAGE_LIST_DIGEST})
+	[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST}"* ]]
+
+	output=$(crictl images --quiet @"$imageid")
+	[ "$output" != "" ]
+
+	output=$(crictl images --quiet "$imageid")
+	[ "$output" != "" ]
+
+	cleanup_images
+}
+
+@test "image pull and list by individual and manifest list digest" {
+	start_crio
+
+	case $(go env GOARCH) in
+	amd64)
+		crictl pull ${IMAGE_LIST_DIGEST_AMD64}
+		output=$(crictl images -v ${IMAGE_LIST_DIGEST_AMD64})
+		[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST_AMD64}"* ]]
+		;;
+	esac
+
+	crictl pull ${IMAGE_LIST_DIGEST}
+
+	imageid=$(crictl images --quiet ${IMAGE_LIST_DIGEST})
+	[ "$imageid" != "" ]
+
+	output=$(crictl images -v ${IMAGE_LIST_DIGEST})
+	[[ "$output" == *"RepoDigests: ${IMAGE_LIST_DIGEST}"* ]]
+
+	output=$(crictl images --quiet @"$imageid")
+	[ "$output" != "" ]
+
+	output=$(crictl images --quiet "$imageid")
 	[ "$output" != "" ]
 
 	cleanup_images
 }
 
 @test "image list with filter" {
-	start_crio "" "" --no-pause-image
-	run crictl pull "$IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	run crictl images --quiet "$IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		run crictl rmi "$id"
-		echo "$output"
-		[ "$status" -eq 0 ]
+	start_crio
+	crictl pull "$IMAGE"
+	output=$(crictl images --quiet "$IMAGE")
+	[ "$output" != "" ]
+	for id in $output; do
+		crictl rmi "$id"
 	done
-	run crictl images --quiet
-	echo "$output"
-	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		echo "$id"
-		status=1
-	done
+	crictl images --quiet
+
 	cleanup_images
 }
 
 @test "image list/remove" {
-	start_crio "" "" --no-pause-image
-	run crictl pull "$IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	run crictl images --quiet
-	echo "$output"
-	[ "$status" -eq 0 ]
+	start_crio
+	crictl pull "$IMAGE"
+	output=$(crictl images --quiet)
 	[ "$output" != "" ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		run crictl rmi "$id"
-		echo "$output"
-		[ "$status" -eq 0 ]
+	for id in $output; do
+		crictl rmi "$id"
 	done
-	run crictl images --quiet
-	echo "$output"
-	[ "$status" -eq 0 ]
+	output=$(crictl images --quiet)
 	[ "$output" = "" ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		echo "$id"
-		status=1
-	done
+
 	cleanup_images
 }
 
 @test "image status/remove" {
-	start_crio "" "" --no-pause-image
-	run crictl pull "$IMAGE"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	run crictl images --quiet
-	echo "$output"
-	[ "$status" -eq 0 ]
+	start_crio
+	crictl pull "$IMAGE"
+	output=$(crictl images --quiet)
 	[ "$output" != "" ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		run crictl images -v "$id"
-		echo "$output"
-		[ "$status" -eq 0 ]
-		[ "$output" != "" ]
-		run crictl rmi "$id"
-		echo "$output"
-		[ "$status" -eq 0 ]
+	for id in $output; do
+		img=$(crictl images -v "$id")
+		[ "$img" != "" ]
+		crictl rmi "$id"
 	done
-	run crictl images --quiet
-	echo "$output"
-	[ "$status" -eq 0 ]
+	output=$(crictl images --quiet)
 	[ "$output" = "" ]
-	printf '%s\n' "$output" | while IFS= read -r id; do
-		echo "$id"
-		status=1
-	done
+
 	cleanup_images
 }

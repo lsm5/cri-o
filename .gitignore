@@ -1,13 +1,12 @@
 /.artifacts/
 /.gopathok
 /_output/
-/conmon/config.h
-/conmon/conmon.o
 /docs/*.[158]
 /docs/*.[158].gz
 /crio.conf
 *.o
 *.orig
+*.test
 /pause/pause.o
 /bin/
 /test/bin2img/bin2img
@@ -18,10 +17,8 @@ coverprofile
 .gdb_history
 *gomock_reflect*
 lib/state.json
-result-*bin
+result
 *_junit.xml
-bundle/tmp
-bundle/*.tar.gz
 
 ./Vagrantfile
 .vagrant/
@@ -41,3 +38,6 @@ bundle/*.tar.gz
 *~
 \#*\#
 .\#*
+
+# See https://github.com/cri-o/cri-o/issues/4820
+/vendor/**/.gitattributes

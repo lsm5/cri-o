@@ -3,38 +3,36 @@ package server
 import (
 	"fmt"
 
+	"github.com/cri-o/cri-o/server/cri/types"
 	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // networkNotReadyReason is the reason reported when network is not ready.
 const networkNotReadyReason = "NetworkPluginNotReady"
 
 // Status returns the status of the runtime
-func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (resp *pb.StatusResponse, err error) {
-	runtimeCondition := &pb.RuntimeCondition{
-		Type:   pb.RuntimeReady,
+func (s *Server) Status(ctx context.Context, req *types.StatusRequest) (*types.StatusResponse, error) {
+	runtimeCondition := &types.RuntimeCondition{
+		Type:   types.RuntimeReady,
 		Status: true,
 	}
-	networkCondition := &pb.RuntimeCondition{
-		Type:   pb.NetworkReady,
+	networkCondition := &types.RuntimeCondition{
+		Type:   types.NetworkReady,
 		Status: true,
 	}
 
-	if err := s.netPlugin.Status(); err != nil {
+	if err := s.config.CNIPlugin().Status(); err != nil {
 		networkCondition.Status = false
 		networkCondition.Reason = networkNotReadyReason
 		networkCondition.Message = fmt.Sprintf("Network plugin returns error: %v", err)
 	}
 
-	resp = &pb.StatusResponse{
-		Status: &pb.RuntimeStatus{
-			Conditions: []*pb.RuntimeCondition{
+	return &types.StatusResponse{
+		Status: &types.RuntimeStatus{
+			Conditions: []*types.RuntimeCondition{
 				runtimeCondition,
 				networkCondition,
 			},
 		},
-	}
-
-	return resp, nil
+	}, nil
 }

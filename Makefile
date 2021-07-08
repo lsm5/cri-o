@@ -3,15 +3,10 @@ GO ?= go
 export GOPROXY=https://proxy.golang.org
 export GOSUMDB=https://sum.golang.org
 
-# test for go module support
-ifeq ($(shell go help mod >/dev/null 2>&1 && echo true), true)
-export GO_BUILD=GO111MODULE=on $(GO) build -mod=vendor
-else
-export GO_BUILD=$(GO) build
-endif
+GO_BUILD ?= $(GO) build
+GO_RUN ?= $(GO) run
 
 PROJECT := github.com/cri-o/cri-o
-CRIO_IMAGE = crio_dev$(if $(GIT_BRANCH_CLEAN),:$(GIT_BRANCH_CLEAN))
 CRIO_INSTANCE := crio_dev
 PREFIX ?= ${DESTDIR}/usr/local
 BINDIR ?= ${PREFIX}/bin
@@ -37,7 +32,6 @@ COVERAGE_PATH := ${BUILD_PATH}/coverage
 JUNIT_PATH := ${BUILD_PATH}/junit
 TESTBIN_PATH := ${BUILD_PATH}/test
 MOCK_PATH := ${PWD}/test/mocks
-MOCKGEN_FLAGS := --build_flags='--tags=test $(BUILDTAGS)'
 
 BASHINSTALLDIR=${PREFIX}/share/bash-completion/completions
 FISHINSTALLDIR=${PREFIX}/share/fish/completions
@@ -51,13 +45,23 @@ SOURCE_DATE_EPOCH ?= $(shell date +%s)
 GO_MD2MAN ?= ${BUILD_BIN_PATH}/go-md2man
 GINKGO := ${BUILD_BIN_PATH}/ginkgo
 MOCKGEN := ${BUILD_BIN_PATH}/mockgen
-GIT_VALIDATION := ${BUILD_BIN_PATH}/git-validation
-RELEASE_TOOL := ${BUILD_BIN_PATH}/release-tool
 GOLANGCI_LINT := ${BUILD_BIN_PATH}/golangci-lint
+GO_MOD_OUTDATED := ${BUILD_BIN_PATH}/go-mod-outdated
+RELEASE_NOTES := ${BUILD_BIN_PATH}/release-notes
+ZEITGEIST := ${BUILD_BIN_PATH}/zeitgeist
+SHFMT := ${BUILD_BIN_PATH}/shfmt
+SHELLCHECK := ${BUILD_BIN_PATH}/shellcheck
+BATS_FILES := $(wildcard test/*.bats)
 
-NIX_IMAGE := saschagrunert/crionix:1.0.0
+ifeq ($(shell bash -c '[[ `command -v git` && `git rev-parse --git-dir 2>/dev/null` ]] && echo true'), true)
+	COMMIT_NO := $(shell git rev-parse HEAD 2> /dev/null || true)
+	GIT_TREE_STATE := $(if $(shell git status --porcelain --untracked-files=no),dirty,clean)
+else
+	COMMIT_NO := unknown
+	GIT_TREE_STATE := unknown
+endif
 
-# pass crio CLI options to generate custom crio.conf build time
+# pass crio CLI options to generate custom configuration options at build time
 CONF_OVERRIDES ?=
 
 CROSS_BUILD_TARGETS := \
@@ -72,16 +76,37 @@ unexport GOBIN
 endif
 GOPKGDIR := $(GOPATH)/src/$(PROJECT)
 GOPKGBASEDIR := $(shell dirname "$(GOPKGDIR)")
+GO_FILES := $(shell find . -type f -name '*.go' -not -name '*_test.go')
 
 # Update VPATH so make finds .gopathok
 VPATH := $(VPATH):$(GOPATH)
-SHRINKFLAGS := -s -w
-BASE_LDFLAGS = ${SHRINKFLAGS} -X main.gitCommit=${GIT_COMMIT} -X main.buildInfo=${SOURCE_DATE_EPOCH}
-LDFLAGS = -ldflags '${BASE_LDFLAGS}'
+
+# Set DEBUG=1 to enable debug symbols in binaries
+DEBUG ?= 0
+ifeq ($(DEBUG),0)
+SHRINKFLAGS = -s -w
+else
+GCFLAGS = -gcflags '-N -l'
+endif
+
+DEFAULTS_PATH := ""
+
+DATE_FMT = +'%Y-%m-%dT%H:%M:%SZ'
+ifdef SOURCE_DATE_EPOCH
+    BUILD_DATE ?= $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" "$(DATE_FMT)" 2>/dev/null || date -u -r "$(SOURCE_DATE_EPOCH)" "$(DATE_FMT)" 2>/dev/null || date -u "$(DATE_FMT)")
+else
+    BUILD_DATE ?= $(shell date -u "$(DATE_FMT)")
+endif
+
+BASE_LDFLAGS = ${SHRINKFLAGS} \
+	-X ${PROJECT}/internal/pkg/criocli.DefaultsPath=${DEFAULTS_PATH} \
+	-X ${PROJECT}/internal/version.buildDate=${BUILD_DATE} \
+	-X ${PROJECT}/internal/version.gitCommit=${COMMIT_NO} \
+	-X ${PROJECT}/internal/version.gitTreeState=${GIT_TREE_STATE}
+
+GO_LDFLAGS = -ldflags '${BASE_LDFLAGS} ${EXTRA_LDFLAGS}'
 
 all: binaries crio.conf docs
-
-include Makefile.inc
 
 default: help
 
@@ -89,11 +114,13 @@ help:
 	@echo "Usage: make <target>"
 	@echo
 	@echo " * 'install' - Install binaries to system locations"
-	@echo " * 'binaries' - Build crio, and pause"
+	@echo " * 'binaries' - Build crio and pinns"
 	@echo " * 'release-note' - Generate release note"
-	@echo " * 'integration' - Execute integration tests"
+	@echo " * 'localintegration' - Execute integration tests"
 	@echo " * 'clean' - Clean artifacts"
 	@echo " * 'lint' - Execute the source code linter"
+	@echo " * 'shfmt' - shell format check and apply diff"
+	@echo " * 'shellcheck' - Execute the shellcheck linter"
 
 # Dummy target for marking pattern rules phony
 .explicit_phony:
@@ -105,45 +132,69 @@ ifeq ("$(wildcard $(GOPKGDIR))","")
 endif
 	touch "$(GOPATH)/.gopathok"
 
+# See also: .github/workflows/lint.yml
 lint: .gopathok ${GOLANGCI_LINT}
+	${GOLANGCI_LINT} version
+	${GOLANGCI_LINT} linters
 	${GOLANGCI_LINT} run
 
-bin/pause:
-	$(MAKE) -C pause
+check-log-lines:
+	./hack/log-capitalized.sh
+	./hack/tree_status.sh
 
-test/bin2img/bin2img: git-vars .gopathok $(wildcard test/bin2img/*.go)
-	$(GO_BUILD) $(LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/test/bin2img
+shellfiles: ${SHFMT}
+	$(eval SHELLFILES=$(shell ${SHFMT} -f . | grep -v vendor/ | grep -v hack/lib | grep -v hack/build-rpms.sh))
 
-test/copyimg/copyimg: git-vars .gopathok $(wildcard test/copyimg/*.go)
-	$(GO_BUILD) $(LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/test/copyimg
+shfmt: shellfiles
+	${SHFMT} -ln bash -w -i 4 -d ${SHELLFILES}
+	${SHFMT} -ln bats -w -sr -d $(BATS_FILES)
 
-test/checkseccomp/checkseccomp: git-vars .gopathok $(wildcard test/checkseccomp/*.go)
-	$(GO_BUILD) $(LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/test/checkseccomp
+shellcheck: shellfiles ${SHELLCHECK}
+	${SHELLCHECK} \
+		-P contrib/bundle \
+		-P scripts \
+		-P test \
+		-x \
+		${SHELLFILES} ${BATS_FILES}
 
-bin/crio: git-vars .gopathok
-	$(GO_BUILD) $(LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/cmd/crio
+bin/pinns:
+	$(MAKE) -C pinns
 
-bin/crio-status: git-vars .gopathok
-	$(GO_BUILD) $(LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/cmd/crio-status
+test/copyimg/copyimg: $(GO_FILES) .gopathok
+	$(GO_BUILD) $(GCFLAGS) $(GO_LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/test/copyimg
 
-build-static: git-vars
-	$(CONTAINER_RUNTIME) run --rm -it -v $(shell pwd):/cri-o $(NIX_IMAGE) sh -c \
-		"nix-build cri-o/nix --argstr revision $(COMMIT_NO) && \
-		mkdir -p cri-o/bin && \
-		cp result-*bin/bin/crio-* cri-o/bin && \
-		cp result-*bin/libexec/crio/* cri-o/bin"
+test/checkseccomp/checkseccomp: $(GO_FILES) .gopathok
+	$(GO_BUILD) $(GCFLAGS) $(GO_LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/test/checkseccomp
 
-release-bundle: clean build-static docs crio.conf bundle
+bin/crio: $(GO_FILES) .gopathok
+	$(GO_BUILD) $(GCFLAGS) $(GO_LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/cmd/crio
 
-nix-image: git-vars
-	time $(CONTAINER_RUNTIME) build -t $(NIX_IMAGE) \
-		--build-arg COMMIT=$(COMMIT_NO) -f Dockerfile-nix .
+bin/crio-status: $(GO_FILES) .gopathok
+	$(GO_BUILD) $(GCFLAGS) $(GO_LDFLAGS) -tags "$(BUILDTAGS)" -o $@ $(PROJECT)/cmd/crio-status
+
+build-static:
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /:/mnt \
+		nixos/nix cp -rfT /nix /mnt/nix
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /nix:/nix -v ${PWD}:${PWD} -w ${PWD} \
+		nixos/nix nix --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/
+	mkdir -p bin
+	cp -r result/bin bin/static
+
+release-bundle: clean bin/pinns build-static docs crio.conf bundle
 
 crio.conf: bin/crio
-	./bin/crio --config="" $(CONF_OVERRIDES) config  > crio.conf
+	./bin/crio -d "" --config="" $(CONF_OVERRIDES) config > crio.conf
 
-release-note: ${RELEASE_TOOL}
-	${RELEASE_TOOL} -n $(release)
+release:
+	${GO_RUN} ./scripts/release
+
+release-notes: ${RELEASE_NOTES}
+	${GO_RUN} ./scripts/release-notes \
+		--output-path ${BUILD_PATH}/release-notes
+
+dependencies: ${GO_MOD_OUTDATED}
+	${GO_RUN} ./scripts/dependencies \
+		--output-path ${BUILD_PATH}/dependencies
 
 clean:
 ifneq ($(GOPATH),)
@@ -154,10 +205,8 @@ endif
 	rm -fr test/testdata/redis-image
 	find . -name \*~ -delete
 	find . -name \#\* -delete
-	rm -f bin/crio
-	rm -f bin/crio.cross.*
-	$(MAKE) -C pause clean
-	rm -f test/bin2img/bin2img
+	rm -rf bin/
+	$(MAKE) -C pinns clean
 	rm -f test/copyimg/copyimg
 	rm -f test/checkseccomp/checkseccomp
 	rm -rf ${BUILD_BIN_PATH}
@@ -168,37 +217,17 @@ endif
 local-cross:
 	@$(MAKE) --keep-going $(CROSS_BUILD_TARGETS)
 
-bin/crio.cross.%: git-vars .gopathok .explicit_phony
+bin/crio.cross.%: .gopathok .explicit_phony
 	@echo "==> make $@"; \
 	TARGET="$*"; \
 	GOOS="$${TARGET%%.*}" \
 	GOARCH="$${TARGET##*.}" \
-	$(GO_BUILD) $(LDFLAGS) -tags "containers_image_openpgp btrfs_noversion" -o "$@" $(PROJECT)/cmd/crio
+	$(GO_BUILD) $(GO_LDFLAGS) -tags "containers_image_openpgp btrfs_noversion" -o "$@" $(PROJECT)/cmd/crio
 
-crioimage: git-vars
-	$(CONTAINER_RUNTIME) build -t ${CRIO_IMAGE} .
+nixpkgs:
+	@nix run -f channel:nixos-20.09 nix-prefetch-git -c nix-prefetch-git \
+		--no-deepClone https://github.com/nixos/nixpkgs > nix/nixpkgs.json
 
-dbuild: crioimage
-	$(CONTAINER_RUNTIME) run --rm --name=${CRIO_INSTANCE} --privileged \
-		-v $(shell pwd):/go/src/${PROJECT} -w /go/src/${PROJECT} \
-		${CRIO_IMAGE} make
-
-integration: ${GINKGO} crioimage
-	$(CONTAINER_RUNTIME) run \
-		-e CI=true \
-		-e CRIO_BINARY \
-		-e JOBS \
-		-e RUN_CRITEST \
-		-e STORAGE_OPTIONS="-s=vfs" \
-		-e TESTFLAGS \
-		-e TEST_USERNS \
-		-it --privileged --rm \
-		-v $(shell pwd):/go/src/${PROJECT} \
-		-v ${GINKGO}:/usr/bin/ginkgo \
-		-w /go/src/${PROJECT} \
-		--sysctl net.ipv6.conf.all.disable_ipv6=0 \
-		${CRIO_IMAGE} \
-		make localintegration
 
 define go-build
 	$(shell cd `pwd` && $(GO_BUILD) -o $(BUILD_BIN_PATH)/$(shell basename $(1)) $(1))
@@ -214,28 +243,45 @@ ${GINKGO}:
 ${MOCKGEN}:
 	$(call go-build,./vendor/github.com/golang/mock/mockgen)
 
-${GIT_VALIDATION}:
-	$(call go-build,./vendor/github.com/vbatts/git-validation)
+${RELEASE_NOTES}:
+	$(call go-build,./vendor/k8s.io/release/cmd/release-notes)
 
-${RELEASE_TOOL}:
-	$(call go-build,./vendor/github.com/containerd/project/cmd/release-tool)
+${SHFMT}:
+	$(call go-build,./vendor/mvdan.cc/sh/v3/cmd/shfmt)
+
+${GO_MOD_OUTDATED}:
+	$(call go-build,./vendor/github.com/psampaz/go-mod-outdated)
+
+${ZEITGEIST}:
+	$(call go-build,./vendor/sigs.k8s.io/zeitgeist)
 
 ${GOLANGCI_LINT}:
-	export \
-		VERSION=v1.21.0 \
+	export VERSION=v1.40.1 \
 		URL=https://raw.githubusercontent.com/golangci/golangci-lint \
 		BINDIR=${BUILD_BIN_PATH} && \
-	curl -sfL $$URL/$$VERSION/install.sh | sh -s $$VERSION
+	curl -sSfL $$URL/$$VERSION/install.sh | sh -s $$VERSION
 
+${SHELLCHECK}:
+	mkdir -p ${BUILD_BIN_PATH} && \
+	VERSION=v0.7.0 \
+	URL=https://github.com/koalaman/shellcheck/releases/download/$$VERSION/shellcheck-$$VERSION.linux.x86_64.tar.xz \
+	SHA256SUM=c37d4f51e26ec8ab96b03d84af8c050548d7288a47f755ffb57706c6c458e027 && \
+	curl -sSfL $$URL | tar xfJ - -C ${BUILD_BIN_PATH} --strip 1 shellcheck-$$VERSION/shellcheck && \
+	sha256sum ${SHELLCHECK} | grep -q $$SHA256SUM
+
+vendor: export GOSUMDB :=
 vendor:
-	export GO111MODULE=on \
-		$(GO) mod tidy && \
-		$(GO) mod vendor && \
-		$(GO) mod verify
+	$(GO) mod tidy
+	$(GO) mod vendor
+	$(GO) mod verify
+
+check-vendor: vendor
+	./hack/tree_status.sh
 
 testunit: ${GINKGO}
 	rm -rf ${COVERAGE_PATH} && mkdir -p ${COVERAGE_PATH}
 	rm -rf ${JUNIT_PATH} && mkdir -p ${JUNIT_PATH}
+	ACK_GINKGO_DEPRECATIONS=1.16.0 \
 	${BUILD_BIN_PATH}/ginkgo \
 		${TESTFLAGS} \
 		-r \
@@ -245,12 +291,14 @@ testunit: ${GINKGO}
 		--outputdir ${COVERAGE_PATH} \
 		--coverprofile coverprofile \
 		--tags "test $(BUILDTAGS)" \
+		$(GO_MOD_VENDOR) \
 		--succinct
-	# fixes https://github.com/onsi/ginkgo/issues/518
-	sed -i '2,$${/^mode: atomic/d;}' ${COVERAGE_PATH}/coverprofile
 	$(GO) tool cover -html=${COVERAGE_PATH}/coverprofile -o ${COVERAGE_PATH}/coverage.html
 	$(GO) tool cover -func=${COVERAGE_PATH}/coverprofile | sed -n 's/\(total:\).*\([0-9][0-9].[0-9]\)/\1 \2/p'
-	find . -name '*_junit.xml' -exec mv -t ${JUNIT_PATH} {} +
+	for f in $$(find . -name "*_junit.xml"); do \
+		mkdir -p $(JUNIT_PATH)/$$(dirname $$f) ;\
+		mv $$f $(JUNIT_PATH)/$$(dirname $$f) ;\
+	done
 
 testunit-bin:
 	mkdir -p ${TESTBIN_PATH}
@@ -265,55 +313,47 @@ mockgen: \
 	mock-criostorage \
 	mock-lib-config \
 	mock-oci \
-	mock-sandbox \
 	mock-image-types \
 	mock-ocicni-types
 
 mock-containerstorage: ${MOCKGEN}
 	${MOCKGEN} \
-		${MOCKGEN_FLAGS} \
 		-package containerstoragemock \
 		-destination ${MOCK_PATH}/containerstorage/containerstorage.go \
 		github.com/containers/storage Store
 
+mock-cmdrunner: ${MOCKGEN}
+	${MOCKGEN} \
+		-package cmdrunnermock \
+		-destination ${MOCK_PATH}/cmdrunner/cmdrunner.go \
+		github.com/cri-o/cri-o/utils/cmdrunner CommandRunner
+
 mock-criostorage: ${MOCKGEN}
 	${MOCKGEN} \
-		${MOCKGEN_FLAGS} \
 		-package criostoragemock \
 		-destination ${MOCK_PATH}/criostorage/criostorage.go \
-		github.com/cri-o/cri-o/internal/pkg/storage ImageServer,RuntimeServer
+		github.com/cri-o/cri-o/internal/storage ImageServer,RuntimeServer
 
 mock-lib-config: ${MOCKGEN}
 	${MOCKGEN} \
-		${MOCKGEN_FLAGS} \
 		-package libconfigmock \
 		-destination ${MOCK_PATH}/lib/lib.go \
-		github.com/cri-o/cri-o/internal/lib/config Iface
+		github.com/cri-o/cri-o/pkg/config Iface
 
 mock-oci: ${MOCKGEN}
 	${MOCKGEN} \
-		${MOCKGEN_FLAGS} \
 		-package ocimock \
 		-destination ${MOCK_PATH}/oci/oci.go \
 		github.com/cri-o/cri-o/internal/oci RuntimeImpl
 
-mock-sandbox: ${MOCKGEN}
-	${MOCKGEN} \
-		${MOCKGEN_FLAGS} \
-		-package sandboxmock \
-		-destination ${MOCK_PATH}/sandbox/sandbox.go \
-		github.com/cri-o/cri-o/internal/lib/sandbox NetNsIface
-
 mock-image-types: ${MOCKGEN}
 	${BUILD_BIN_PATH}/mockgen \
-		${MOCKGEN_FLAGS} \
 		-package imagetypesmock \
-		-destination ${MOCK_PATH}/containers/image/types.go \
-		github.com/containers/image/v4/types ImageCloser
+		-destination ${MOCK_PATH}/containers/image/v5/types.go \
+		github.com/containers/image/v5/types ImageCloser
 
 mock-ocicni-types: ${MOCKGEN}
 	${BUILD_BIN_PATH}/mockgen \
-		${MOCKGEN_FLAGS} \
 		-package ocicnitypesmock \
 		-destination ${MOCK_PATH}/ocicni/types.go \
 		github.com/cri-o/ocicni/pkg/ocicni CNIPlugin
@@ -325,8 +365,8 @@ codecov:
 localintegration: clean binaries test-binaries
 	./test/test_runner.sh ${TESTFLAGS}
 
-binaries: bin/crio bin/pause bin/crio-status
-test-binaries: test/bin2img/bin2img test/copyimg/copyimg test/checkseccomp/checkseccomp
+binaries: bin/crio bin/crio-status bin/pinns
+test-binaries: test/copyimg/copyimg test/checkseccomp/checkseccomp
 
 MANPAGES_MD := $(wildcard docs/*.md)
 MANPAGES    := $(MANPAGES_MD:%.md=%)
@@ -339,7 +379,7 @@ docs/%.8: docs/%.8.md .gopathok ${GO_MD2MAN}
 	(${GO_MD2MAN} -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@) || \
 		(${GO_MD2MAN} -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@)
 
-completions: binaries
+completions-generation:
 	bin/crio complete bash > completions/bash/crio
 	bin/crio complete fish > completions/fish/crio.fish
 	bin/crio complete zsh  > completions/zsh/_crio
@@ -347,33 +387,59 @@ completions: binaries
 	bin/crio-status complete fish > completions/fish/crio-status.fish
 	bin/crio-status complete zsh  > completions/zsh/_crio-status
 
-docs: $(MANPAGES) completions
+docs: $(MANPAGES)
 
 docs-generation:
 	bin/crio-status md  > docs/crio-status.8.md
 	bin/crio-status man > docs/crio-status.8
+	bin/crio -d "" --config="" md  > docs/crio.8.md
+	bin/crio -d "" --config="" man > docs/crio.8
 
 bundle:
-	bundle/build
+	contrib/bundle/build
 
-install: .gopathok install.bin install.man install.completions
+bundle-test:
+	sudo contrib/bundle/test
 
-install.bin: binaries
+bundle-test-e2e:
+	sudo contrib/bundle/test-e2e
+
+bundles:
+	contrib/bundle/build amd64
+	contrib/bundle/build arm64
+
+get-script:
+	sed -i '/# INCLUDE/q' scripts/get
+	cat contrib/bundle/install-paths contrib/bundle/install >> scripts/get
+
+verify-dependencies: ${ZEITGEIST}
+	${BUILD_BIN_PATH}/zeitgeist validate --local-only --base-path . --config dependencies.yaml
+
+install: .gopathok install.bin install.man install.completions install.systemd install.config
+
+install.bin-nobuild:
 	install ${SELINUXOPT} -D -m 755 bin/crio $(BINDIR)/crio
 	install ${SELINUXOPT} -D -m 755 bin/crio-status $(BINDIR)/crio-status
-	install ${SELINUXOPT} -D -m 755 bin/pause $(LIBEXECDIR)/crio/pause
+	install ${SELINUXOPT} -D -m 755 bin/pinns $(BINDIR)/pinns
 
-install.man: $(MANPAGES)
+install.bin: binaries install.bin-nobuild
+
+install.man-nobuild:
 	install ${SELINUXOPT} -d -m 755 $(MANDIR)/man5
 	install ${SELINUXOPT} -d -m 755 $(MANDIR)/man8
 	install ${SELINUXOPT} -m 644 $(filter %.5,$(MANPAGES)) -t $(MANDIR)/man5
 	install ${SELINUXOPT} -m 644 $(filter %.8,$(MANPAGES)) -t $(MANDIR)/man8
 
-install.config: crio.conf
+install.man: $(MANPAGES) install.man-nobuild
+
+install.config-nobuild:
 	install ${SELINUXOPT} -d $(DATAROOTDIR)/oci/hooks.d
+	install ${SELINUXOPT} -d $(ETCDIR_CRIO)/crio.conf.d
 	install ${SELINUXOPT} -D -m 644 crio.conf $(ETCDIR_CRIO)/crio.conf
 	install ${SELINUXOPT} -D -m 644 crio-umount.conf $(OCIUMOUNTINSTALLDIR)/crio-umount.conf
 	install ${SELINUXOPT} -D -m 644 crictl.yaml $(CRICTL_CONFIG_DIR)
+
+install.config: crio.conf install.config-nobuild
 
 install.completions:
 	install ${SELINUXOPT} -d -m 755 ${BASHINSTALLDIR}
@@ -395,7 +461,7 @@ install.systemd:
 uninstall:
 	rm -f $(BINDIR)/crio
 	rm -f $(BINDIR)/crio-status
-	rm -f $(LIBEXECDIR)/crio/pause
+	rm -f $(BINDIR)/pinns
 	for i in $(filter %.5,$(MANPAGES)); do \
 		rm -f $(MANDIR)/man5/$$(basename $${i}); \
 	done
@@ -408,26 +474,47 @@ uninstall:
 	rm -f ${BASHINSTALLDIR}/crio-status
 	rm -f ${FISHINSTALLDIR}/crio-status.fish
 	rm -f ${ZSHINSTALLDIR}/_crio-status
-
-git-validation: .gopathok git-vars ${GIT_VALIDATION}
-	GIT_CHECK_EXCLUDE="vendor" \
-		${GIT_VALIDATION} -v -run DCO,short-subject,dangling-whitespace \
-			-range ${GIT_MERGE_BASE}..HEAD
+	rm -f $(PREFIX)/lib/systemd/system/crio-wipe.service
+	rm -f $(PREFIX)/lib/systemd/system/crio-shutdown.service
+	rm -f $(PREFIX)/lib/systemd/system/crio.service
+	rm -f $(PREFIX)/lib/systemd/system/cri-o.service
+	rm -rf $(DATAROOTDIR)/oci/hooks.d
+	rm -f $(ETCDIR_CRIO)/crio.conf
+	rm -rf $(ETCDIR_CRIO)/crio.conf.d
+	rm -f $(OCIUMOUNTINSTALLDIR)/crio-umount.conf
+	rm -f $(CRICTL_CONFIG_DIR)/crictl.yaml
 
 docs-validation:
-	$(GO) run -tags "$(BUILDTAGS)" ./test/docs-validation
+	$(GO_RUN) -tags "$(BUILDTAGS)" ./test/docs-validation
+
+release-branch-forward:
+	$(GO_RUN) ./scripts/release-branch-forward
+
+upload-artifacts:
+	./scripts/upload-artifacts
+
+bin/metrics-exporter:
+	$(GO_BUILD) -o $@ \
+		-ldflags '-linkmode external -extldflags "-static -lm"' \
+		-tags netgo \
+		$(PROJECT)/contrib/metrics-exporter
+
+metrics-exporter: bin/metrics-exporter
+	$(CONTAINER_RUNTIME) build . \
+		-f contrib/metrics-exporter/Containerfile \
+		-t quay.io/crio/metrics-exporter:latest
 
 .PHONY: \
 	.explicit_phony \
 	git-validation \
-	bin/crio \
-	bin/crio-status \
-	bin/pause \
 	binaries \
 	bundle \
+	bundles \
+	bundle-test \
 	build-static \
 	clean \
 	completions \
+	config \
 	default \
 	docs \
 	docs-validation \
@@ -435,7 +522,24 @@ docs-validation:
 	install \
 	lint \
 	local-cross \
-	nix-image \
+	nixpkgs \
 	release-bundle \
+	shellfiles \
+	shfmt \
+	release-branch-forward \
+	shellcheck \
+	testunit \
+	testunit-bin \
+	test-images \
 	uninstall \
-	vendor
+	vendor \
+	check-vendor \
+	bin/pinns \
+	dependencies \
+	upload-artifacts \
+	bin/metrics-exporter \
+	metrics-exporter \
+	release \
+	get-script \
+	check-log-lines \
+	verify-dependencies

@@ -1,26 +1,27 @@
 package server
 
 import (
-	"github.com/cri-o/cri-o/internal/pkg/log"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/server/cri/types"
 	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // RemoveContainer removes the container. If the container is running, the container
 // should be force removed.
-func (s *Server) RemoveContainer(ctx context.Context, req *pb.RemoveContainerRequest) (resp *pb.RemoveContainerResponse, err error) {
+func (s *Server) RemoveContainer(ctx context.Context, req *types.RemoveContainerRequest) error {
+	log.Infof(ctx, "Removing container: %s", req.ContainerID)
 	// save container description to print
-	c, err := s.GetContainerFromShortID(req.ContainerId)
+	c, err := s.GetContainerFromShortID(req.ContainerID)
 	if err != nil {
-		return nil, err
+		return status.Errorf(codes.NotFound, "could not find container %q: %v", req.ContainerID, err)
 	}
 
-	_, err = s.ContainerServer.Remove(ctx, req.ContainerId, true)
-	if err != nil {
-		return nil, err
+	if _, err := s.ContainerServer.Remove(ctx, req.ContainerID, true); err != nil {
+		return err
 	}
 
-	log.Infof(ctx, "Removed container %s", c.Description())
-	resp = &pb.RemoveContainerResponse{}
-	return resp, nil
+	log.Infof(ctx, "Removed container %s: %s", c.ID(), c.Description())
+	return nil
 }

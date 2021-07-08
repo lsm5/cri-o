@@ -8,6 +8,15 @@
     version: "{{ k8s_git_version }}"
     force: "{{ force_clone | default(False) | bool}}"
 
+# replace hardcoded line not to use legacy stats provider
+- name: use CRI stats
+  lineinfile:
+    path: "{{ ansible_env.GOPATH }}/src/k8s.io/kubernetes/pkg/kubelet/cadvisor/util.go"
+    regexp: '^(\s*)runtimeEndpoint == CrioSocket \|\| runtimeEndpoint == \"unix\:\/\/\"\+CrioSocket$'
+    # keep the whitespace to ensure the file still looks pretty :)
+    line: '\1false'
+    backrefs: yes
+
 - name: install etcd
   command: "hack/install-etcd.sh"
   args:
@@ -53,9 +62,15 @@
       export DNS_SERVER_IP={{ ansible_default_ipv4.address }}
       export API_HOST={{ ansible_default_ipv4.address }}
       export API_HOST_IP={{ ansible_default_ipv4.address }}
+      # Use the hostIP as node InternalIP
+      export HOSTNAME_OVERRIDE={{ ansible_default_ipv4.address }}
+      # Listen in all available interfaces
+      export KUBELET_HOST="0.0.0.0"
       export KUBE_ENABLE_CLUSTER_DNS=true
       export ENABLE_HOSTPATH_PROVISIONER=true
+      export KUBELET_FLAGS="--enable-debugging-handlers=true --enable-server=true --anonymous-auth=true"
       export KUBE_ENABLE_CLUSTER_DASHBOARD=true
+      export DBUS_SESSION_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
       ./hack/local-up-cluster.sh
     mode: "u=rwx,g=rwx,o=x"
 

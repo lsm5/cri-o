@@ -41,6 +41,7 @@ larger PRs into smaller ones - it's easier to review smaller
 code changes. But only if those smaller ones make sense as stand-alone PRs.
 
 Regardless of the type of PR, all PRs should include:
+
 * well documented code changes
 * additional testcases. Ideally, they should fail w/o your code change applied
 * documentation changes
@@ -72,11 +73,10 @@ Some maintainers add themselves to [`CODEOWNERS`](.github/CODEOWNERS) to manage 
 
 ### Dependency management
 
-In order to add or update a dependency to this project run:
+In order to add or update a dependency to this project, run:
 
-```
-> export GO111MODULE=on
-> go get -u [DEPENDENCY]
+```console
+$ go get -u [DEPENDENCY]
 ```
 
 Since CRI-O uses go modules we highly recommend reading the [go modules
@@ -85,8 +85,8 @@ section](https://github.com/golang/go/wiki/Modules#daily-workflow).
 
 To ensure the working directory contains all necessary files afterwards, run:
 
-```
-> make vendor
+```console
+$ make vendor
 ```
 
 ### Sign your PRs
@@ -145,9 +145,7 @@ commit automatically with `git commit -s`.
 
 ## Communications
 
-For general questions, or discussions, please use the
-IRC group on `irc.freenode.net` called `cri-o`
-that has been setup.
+For general questions, or discussions, please use our [channel on the Kubernetes slack](https://kubernetes.slack.com/archives/crio).
 
 For discussions around issues/bugs and features, you can use the github
 [issues](https://github.com/cri-o/cri-o/issues)

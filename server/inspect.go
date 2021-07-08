@@ -1,17 +1,18 @@
 package server
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"net/http/pprof"
 
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
 	"github.com/cri-o/cri-o/pkg/types"
 	"github.com/go-zoo/bone"
+	json "github.com/json-iterator/go"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -42,7 +43,7 @@ func (s *Server) getInfo() types.CrioInfo {
 	return types.CrioInfo{
 		StorageDriver:     s.config.Storage,
 		StorageRoot:       s.config.Root,
-		CgroupDriver:      s.config.CgroupManager,
+		CgroupDriver:      s.config.CgroupManager().Name(),
 		DefaultIDMappings: s.getIDMappingsInfo(),
 	}
 }
@@ -55,11 +56,13 @@ var (
 
 func (s *Server) getContainerInfo(id string, getContainerFunc, getInfraContainerFunc func(id string) *oci.Container, getSandboxFunc func(id string) *sandbox.Sandbox) (types.ContainerInfo, error) {
 	ctr := getContainerFunc(id)
+	isInfra := false
 	if ctr == nil {
 		ctr = getInfraContainerFunc(id)
 		if ctr == nil {
 			return types.ContainerInfo{}, errCtrNotFound
 		}
+		isInfra = true
 	}
 	// TODO(mrunalp): should we call UpdateStatus()?
 	ctrState := ctr.State()
@@ -68,18 +71,35 @@ func (s *Server) getContainerInfo(id string, getContainerFunc, getInfraContainer
 	}
 	sb := getSandboxFunc(ctr.Sandbox())
 	if sb == nil {
-		logrus.Debugf("can't find sandbox %s for container %s", ctr.Sandbox(), id)
+		logrus.Debugf("Can't find sandbox %s for container %s", ctr.Sandbox(), id)
 		return types.ContainerInfo{}, errSandboxNotFound
 	}
 	image := ctr.Image()
 	if s.ContainerServer != nil && s.ContainerServer.StorageImageServer() != nil {
-		if status, err := s.ContainerServer.StorageImageServer().ImageStatus(s.systemContext, ctr.ImageRef()); err == nil {
+		if status, err := s.ContainerServer.StorageImageServer().ImageStatus(s.config.SystemContext, ctr.ImageRef()); err == nil {
 			image = status.Name
+		}
+	}
+
+	pidToReturn := ctrState.Pid
+	if isInfra && pidToReturn == 0 {
+		// It is possible the infra container doesn't report a PID.
+		// That can either happen if we're using a vm based runtime,
+		// or if we've dropped the infra container.
+		// Since the Pid is used exclusively to find the network stats,
+		// and pods share their network (whether it's host or pod level)
+		// we can return the pid of a running container in the pod.
+		for _, c := range sb.Containers().List() {
+			ctrPid, err := c.Pid()
+			if ctrPid > 0 && err == nil {
+				pidToReturn = ctrPid
+				break
+			}
 		}
 	}
 	return types.ContainerInfo{
 		Name:            ctr.Name(),
-		Pid:             ctrState.Pid,
+		Pid:             pidToReturn,
 		Image:           image,
 		ImageRef:        ctr.ImageRef(),
 		CreatedTime:     ctrState.Created.UnixNano(),
@@ -100,7 +120,7 @@ const (
 )
 
 // GetInfoMux returns the mux used to serve info requests
-func (s *Server) GetInfoMux() *bone.Mux {
+func (s *Server) GetInfoMux(enableProfile bool) *bone.Mux {
 	mux := bone.New()
 
 	mux.Get(InspectConfigEndpoint, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -156,6 +176,15 @@ func (s *Server) GetInfoMux() *bone.Mux {
 			http.Error(w, fmt.Sprintf("unable to write JSON: %v", err), http.StatusInternalServerError)
 		}
 	}))
+
+	// Add pprof handlers
+	if enableProfile {
+		mux.Get("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+		mux.Get("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+		mux.Get("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+		mux.Get("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+		mux.Get("/debug/pprof/*", http.HandlerFunc(pprof.Index))
+	}
 
 	return mux
 }

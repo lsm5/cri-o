@@ -2,15 +2,14 @@ package server
 
 import (
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/log"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/server/cri/types"
 	"golang.org/x/net/context"
 	"k8s.io/apimachinery/pkg/fields"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // filterSandbox returns whether passed container matches filtering criteria
-func filterSandbox(p *pb.PodSandbox, filter *pb.PodSandboxFilter) bool {
+func filterSandbox(p *types.PodSandbox, filter *types.PodSandboxFilter) bool {
 	if filter != nil {
 		if filter.State != nil {
 			if p.State != filter.State.State {
@@ -28,22 +27,22 @@ func filterSandbox(p *pb.PodSandbox, filter *pb.PodSandboxFilter) bool {
 }
 
 // ListPodSandbox returns a list of SandBoxes.
-func (s *Server) ListPodSandbox(ctx context.Context, req *pb.ListPodSandboxRequest) (resp *pb.ListPodSandboxResponse, err error) {
-	var pods []*pb.PodSandbox
+func (s *Server) ListPodSandbox(ctx context.Context, req *types.ListPodSandboxRequest) (*types.ListPodSandboxResponse, error) {
+	var pods []*types.PodSandbox
 	var podList []*sandbox.Sandbox
 	podList = append(podList, s.ContainerServer.ListSandboxes()...)
 
 	filter := req.Filter
 	// Filter by pod id first.
 	if filter != nil {
-		if filter.Id != "" {
-			id, err := s.PodIDIndex().Get(filter.Id)
+		if filter.ID != "" {
+			id, err := s.PodIDIndex().Get(filter.ID)
 			if err != nil {
 				// Not finding an ID in a filtered list should not be considered
 				// and error; it might have been deleted when stop was done.
 				// Log and return an empty struct.
-				log.Warnf(ctx, "unable to find pod %s with filter", filter.Id)
-				return &pb.ListPodSandboxResponse{}, nil
+				log.Warnf(ctx, "Unable to find pod %s with filter", filter.ID)
+				return &types.ListPodSandboxResponse{}, nil
 			}
 			sb := s.getSandbox(id)
 			if sb == nil {
@@ -59,25 +58,24 @@ func (s *Server) ListPodSandbox(ctx context.Context, req *pb.ListPodSandboxReque
 		if !sb.Created() {
 			continue
 		}
-		podInfraContainer := sb.InfraContainer()
-		if podInfraContainer == nil {
-			// this can't really happen, but if it does because of a bug
-			// it's better not to panic
-			continue
-		}
-		cState := podInfraContainer.StateNoLock()
-		rStatus := pb.PodSandboxState_SANDBOX_NOTREADY
-		if cState.Status == oci.ContainerStateRunning {
-			rStatus = pb.PodSandboxState_SANDBOX_READY
+
+		rStatus := types.PodSandboxStateSandboxNotReady
+		if sb.Ready(false) {
+			rStatus = types.PodSandboxStateSandboxReady
 		}
 
-		pod := &pb.PodSandbox{
-			Id:          sb.ID(),
-			CreatedAt:   podInfraContainer.CreatedAt().UnixNano(),
+		pod := &types.PodSandbox{
+			ID:          sb.ID(),
+			CreatedAt:   sb.CreatedAt().UnixNano(),
 			State:       rStatus,
 			Labels:      sb.Labels(),
 			Annotations: sb.Annotations(),
-			Metadata:    sb.Metadata(),
+			Metadata: &types.PodSandboxMetadata{
+				Name:      sb.Metadata().Name,
+				UID:       sb.Metadata().UID,
+				Namespace: sb.Metadata().Namespace,
+				Attempt:   sb.Metadata().Attempt,
+			},
 		}
 
 		// Filter by other criteria such as state and labels.
@@ -86,8 +84,7 @@ func (s *Server) ListPodSandbox(ctx context.Context, req *pb.ListPodSandboxReque
 		}
 	}
 
-	resp = &pb.ListPodSandboxResponse{
+	return &types.ListPodSandboxResponse{
 		Items: pods,
-	}
-	return resp, nil
+	}, nil
 }

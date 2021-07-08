@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cri-o/cri-o/internal/lib/config"
+	"github.com/cri-o/cri-o/pkg/config"
 	"github.com/sirupsen/logrus"
 )
 
@@ -20,16 +20,18 @@ type entry struct {
 }
 
 const (
-	crioMainPath = "internal/pkg/criocli/criocli.go"
-	crioCLIPath  = "docs/crio.8.md"
-	crioConfPath = "docs/crio.conf.5.md"
+	crioCLIGoPath  = "internal/criocli/criocli.go"
+	crioCLIMdPath  = "docs/crio.8.md"
+	crioConfMdPath = "docs/crio.conf.5.md"
 )
 
 var (
 	// Tags which should be not checked at all
 	excludedTags = []string{
-		"plugin_dir", // deprecated
-		"runtimes",   // printed as separate table
+		"plugin_dir",                  // deprecated
+		"runtimes",                    // printed as separate table
+		"workloads",                   // printed as separate table
+		"manage_network_ns_lifecycle", // deprecated
 	}
 
 	// Tags where it should not validate the values
@@ -38,6 +40,11 @@ var (
 		"root",             // user dependent
 		"runroot",          // user dependent
 		"storage_driver",   // user dependent
+	}
+
+	// Tags where it should not validate the values
+	excludedCLI = []string{
+		"workloads", // too complex an option for a CLI flag
 	}
 
 	// Mapping for inconsistencies between tags and CLI arguments
@@ -78,18 +85,18 @@ func validateTags(cfg *config.Config) (failed bool) {
 	entries := allEntries(cfg)
 
 	// Open the documentation
-	crioConfDoc := openFile(crioConfPath)
+	crioConfDoc := openFile(crioConfMdPath)
 
 	// Parse the template into a buffer
 	var templateBytes bytes.Buffer
-	if err := cfg.WriteTemplate(&templateBytes); err != nil {
+	if err := cfg.WriteTemplate(true, &templateBytes); err != nil {
 		logrus.Fatalf("Unable to write template: %v", err)
 	}
 
 	// Check if the found toml tags are available within the template and docs
 	logrus.Infof(
 		"Verifying TOML tags of `config.go` to `TemplateString` and `%s`",
-		crioConfPath,
+		crioConfMdPath,
 	)
 	for _, entry := range entries {
 		// Skip whitelisted items
@@ -119,7 +126,7 @@ func validateTags(cfg *config.Config) (failed bool) {
 		if err != nil || !docsMatch {
 			logrus.Errorf(
 				"Tag `%s` with expected value `%s` not found in `%s`",
-				entry.tag, entry.value, crioConfPath,
+				entry.tag, entry.value, crioConfMdPath,
 			)
 			failed = true
 		}
@@ -136,12 +143,12 @@ func validateTags(cfg *config.Config) (failed bool) {
 func validateCli(cfg *config.Config) (failed bool) {
 	logrus.Infof(
 		"Verifying command line arguments of `%s` to `%s`",
-		crioMainPath, crioCLIPath,
+		crioCLIGoPath, crioCLIMdPath,
 	)
 
 	entries := allEntries(cfg)
-	crioMain := openFile(crioMainPath)
-	crioCLIDoc := openFile(crioCLIPath)
+	cliGo := openFile(crioCLIGoPath)
+	crioCLIDoc := openFile(crioCLIMdPath)
 
 	for _, entry := range entries {
 		// Assume a simple tag to CLI option conversion
@@ -153,46 +160,45 @@ func validateCli(cfg *config.Config) (failed bool) {
 			cliOption = val
 		}
 
+		if stringInSlice(entry.tag, excludedCLI) {
+			logrus.Debugf("Skipping excluded CLI entry `%s`", entry.tag)
+			continue
+		}
+
 		// Lookup the tag
-		r := regexp.MustCompile(`.*Name:\s+"(` + cliOption + `.*)",`)
-		matches := r.FindStringSubmatch(string(crioMain))
+		nameMatches := regexp.
+			MustCompile(`.*Name:\s+"(` + cliOption + `.*)",`).
+			FindStringSubmatch(string(cliGo))
 
 		// Check if we have enough sub-matches
-		if len(matches) != 2 {
+		if len(nameMatches) != 2 {
 			logrus.Errorf(
 				"No matching CLI option `%s` found (tag `%s`) in `%s`",
-				cliOption, entry.tag, crioMainPath,
+				cliOption, entry.tag, crioCLIGoPath,
 			)
 			failed = true
 			continue
 		}
 
 		// Prepare the option to match the expected output
-		const sep = ", "
-		split := strings.Split(matches[1], sep)
-
-		split[0] = "--" + split[0]
-		if len(split) == 2 {
-			split[1] = "-" + split[1]
-		}
-		option := strings.Join(split, sep)
+		option := "--" + nameMatches[1]
 
 		// Validate synopsis
 		synopsisMatch, err := regexp.Match(`\[`+option+`.*\]`, crioCLIDoc)
 		if err != nil || !synopsisMatch {
 			logrus.Errorf(
 				"CLI option `%s` not found in synopsis of `%s`",
-				option, crioCLIPath,
+				option, crioCLIMdPath,
 			)
 			failed = true
 		}
 
 		// Validate descriptions
-		descriptionMatch, err := regexp.Match(`\*\*`+option+`\*\*`, crioCLIDoc)
+		descriptionMatch, err := regexp.Match(`\*\*`+option+`.*\*\*`, crioCLIDoc)
 		if err != nil || !descriptionMatch {
 			logrus.Errorf(
 				"CLI option `%s` not found in description of `%s`",
-				option, crioCLIPath,
+				option, crioCLIMdPath,
 			)
 			failed = true
 		}
@@ -209,7 +215,7 @@ func validateCli(cfg *config.Config) (failed bool) {
 func openFile(path string) []byte {
 	file, err := ioutil.ReadFile(path)
 	if err != nil {
-		logrus.Fatalf("Unable to open %q: %v", path, err)
+		logrus.Fatalf("Unable to open file: %v", err)
 	}
 	return file
 }
@@ -236,8 +242,8 @@ func recursiveEntries(
 ) {
 	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
 		if v.Kind() == reflect.Ptr {
-			// Skip recursive data
-			if seen[v.Interface()] {
+			// Skip private or recursive data
+			if !v.CanInterface() || seen[v.Interface()] {
 				return
 			}
 			seen[v.Interface()] = true

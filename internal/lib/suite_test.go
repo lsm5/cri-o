@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cri-o/cri-o/internal/hostport"
 	"github.com/cri-o/cri-o/internal/lib"
-	libconfig "github.com/cri-o/cri-o/internal/lib/config"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/oci"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
 	. "github.com/cri-o/cri-o/test/framework"
 	containerstoragemock "github.com/cri-o/cri-o/test/mocks/containerstorage"
 	libmock "github.com/cri-o/cri-o/test/mocks/lib"
@@ -19,8 +20,6 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
 )
 
 // TestLib runs the created specs
@@ -90,7 +89,7 @@ var _ = BeforeSuite(func() {
 		},
 		"linux": {
 			"namespaces": [
-				{"type": "network", "path": "default"}
+				{"type": "network", "path": "/proc/self/ns/net"}
 			]
 		},
 		"process": {
@@ -134,21 +133,21 @@ func beforeEach() {
 	)
 
 	// Setup the sut
-	sut, err = lib.New(context.Background(), nil, libMock)
+	sut, err = lib.New(context.Background(), libMock)
 	Expect(err).To(BeNil())
 	Expect(sut).NotTo(BeNil())
 
 	// Setup test vars
 	mySandbox, err = sandbox.New(sandboxID, "", "", "", "",
 		make(map[string]string), make(map[string]string), "", "",
-		&pb.PodSandboxMetadata{}, "", "", false, "", "", "",
-		[]*hostport.PortMapping{}, false)
+		&sandbox.Metadata{}, "", "", false, "", "", "",
+		[]*hostport.PortMapping{}, false, time.Now(), "")
 	Expect(err).To(BeNil())
 
-	myContainer, err = oci.NewContainer(containerID, "", "", "", "",
+	myContainer, err = oci.NewContainer(containerID, "", "", "",
 		make(map[string]string), make(map[string]string),
 		make(map[string]string), "", "", "",
-		&pb.ContainerMetadata{}, sandboxID, false, false,
+		&oci.Metadata{}, sandboxID, false,
 		false, false, "", "", time.Now(), "")
 	Expect(err).To(BeNil())
 }
@@ -170,8 +169,9 @@ func addContainerAndSandbox() {
 	sut.AddContainer(myContainer)
 	Expect(sut.CtrIDIndex().Add(containerID)).To(BeNil())
 	Expect(sut.PodIDIndex().Add(sandboxID)).To(BeNil())
+	myContainer.SetCreated()
 }
 
 func createDummyState() {
-	Expect(ioutil.WriteFile("state.json", []byte("{}"), 0644)).To(BeNil())
+	Expect(ioutil.WriteFile("state.json", []byte("{}"), 0o644)).To(BeNil())
 }

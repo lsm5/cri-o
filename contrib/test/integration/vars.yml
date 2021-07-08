@@ -4,7 +4,12 @@
 integration_selinux_enabled: True
 e2e_selinux_enabled: False
 node_e2e_selinux_enabled: False
-manage_network_ns_lifecycle: False
+manage_ns_lifecycle: True
+
+build_runc: True
+build_crun: False
+build_kata: False
+cgroupv2: False
 
 # For results.yml Paths use rsync 'source' conventions
 artifacts: "/tmp/artifacts"  # Base-directory for collection
@@ -16,7 +21,7 @@ result_dest_basedir: '{{ lookup("env","WORKSPACE") |
 
 # Environment variables to set when executing integration tests
 int_test_env:
-    CGROUP_MANAGER: "cgroupfs"
+    CGROUP_MANAGER: "systemd"
     STORAGE_OPTIONS: >
         --storage-driver=overlay
 
@@ -27,3 +32,35 @@ ssh_location: "{{ lookup('env','HOME') }}/.ssh/id_rsa"
 # Additional environment variables for integration tests w/ userNS enabled
 userns_int_test_env:
     TEST_USERNS: "1"  # Consumed by test/test_runner.sh, by way of Makefile
+
+kata_int_test_env:
+    CONTAINER_RUNTIMES: "containerd-shim-kata-v2:/usr/bin/containerd-shim-kata-v2:/run/vc:vm"
+    CONTAINER_RUNTIME: "containerd-shim-kata-v2"
+    CONTAINER_DEFAULT_RUNTIME: "containerd-shim-kata-v2"
+    RUNTIME_NAME: "containerd-shim-kata-v2"
+    RUNTIME_ROOT: "/run/vc"
+    RUNTIME_TYPE: "vm"
+    TESTFLAGS: "ctr.bats"
+    JOBS: "1"  # TODO: add support to parallelization in kata (causes failures in the integration tests)
+
+kata_skip_ctr_tests:
+  - 'test "ctr lifecycle"'
+  - 'test "ctr logging"'
+  - 'test "ctr journald logging"'
+  - 'test "ctr log max"'
+  - 'test "ctr log max with minimum value"'
+  - 'test "ctr partial line logging"'
+  - 'test "ctr execsync"'
+  - 'test "ctr execsync should not overwrite initial spec args"'
+  - 'test "privileged ctr device add"'
+  - 'test "ctr execsync std{out,err}"'
+  - 'test "ctr create with non-existent command"'
+  - 'test "ctr create with non-existent command \[tty\]"'
+  - 'test "ctr update resources"'
+  - 'test "ctr resources"'
+  - 'test "ctr with non-root user has no effective capabilities"'
+  - 'test "ctr with low memory configured should not be created"'
+  - 'test "privileged ctr -- check for rw mounts"'
+  - 'test "annotations passed through"'
+  - 'test "ctr with default_env set in configuration"'
+  - 'test "ctr with absent mount that should be rejected"'

@@ -6,8 +6,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cri-o/cri-o/server/cri/types"
 	"github.com/opencontainers/runtime-tools/generate"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 func TestAddOCIBindsForDev(t *testing.T) {
@@ -15,15 +15,15 @@ func TestAddOCIBindsForDev(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	config := &pb.ContainerConfig{
-		Mounts: []*pb.Mount{
+	config := &types.ContainerConfig{
+		Mounts: []*types.Mount{
 			{
 				ContainerPath: "/dev",
 				HostPath:      "/dev",
 			},
 		},
 	}
-	_, binds, err := addOCIBindMounts(context.Background(), "", config, &specgen, "")
+	_, binds, err := addOCIBindMounts(context.Background(), "", config, &specgen, "", nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -49,15 +49,15 @@ func TestAddOCIBindsForSys(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	config := &pb.ContainerConfig{
-		Mounts: []*pb.Mount{
+	config := &types.ContainerConfig{
+		Mounts: []*types.Mount{
 			{
 				ContainerPath: "/sys",
 				HostPath:      "/sys",
 			},
 		},
 	}
-	_, binds, err := addOCIBindMounts(context.Background(), "", config, &specgen, "")
+	_, binds, err := addOCIBindMounts(context.Background(), "", config, &specgen, "", nil)
 	if err != nil {
 		t.Error(err)
 	}

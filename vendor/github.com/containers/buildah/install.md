@@ -4,16 +4,106 @@
 
 ## Installing packaged versions of buildah
 
+#### [Amazon Linux 2](https://aws.amazon.com/amazon-linux-2/)
+
+The [Kubic project](https://build.opensuse.org/project/show/devel:kubic:libcontainers:stable)
+provides updated packages for CentOS 7 which can be used unmodified on Amazon Linux 2.
+
+```bash
+cd /etc/yum.repos.d/
+sudo wget https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/CentOS_7/devel:kubic:libcontainers:stable.repo
+sudo yum -y install yum-plugin-copr
+sudo yum -y copr enable lsm5/container-selinux
+sudo yum -y install buildah
+```
+
 ### [Arch Linux](https://www.archlinux.org)
 
 ```bash
 sudo pacman -S buildah
 ```
 
-### [Fedora](https://www.fedoraproject.org), [CentOS](https://www.centos.org)
+#### [CentOS](https://www.centos.org)
+
+Buildah is available in the default Extras repos for CentOS 7 and in
+the AppStream repo for CentOS 8 and Stream, however the available version often
+lags the upstream release.
 
 ```bash
 sudo yum -y install buildah
+```
+
+The [Kubic project](https://build.opensuse.org/project/show/devel:kubic:libcontainers:stable)
+provides updated packages for CentOS 7, 8 and Stream.
+
+```bash
+# CentOS 7
+sudo curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/CentOS_7/devel:kubic:libcontainers:stable.repo
+sudo yum -y install buildah
+
+# CentOS 8
+sudo dnf -y module disable container-tools
+sudo dnf -y install 'dnf-command(copr)'
+sudo dnf -y copr enable rhcontainerbot/container-selinux
+sudo curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/CentOS_8/devel:kubic:libcontainers:stable.repo
+sudo dnf -y install buildah
+
+# CentOS Stream
+sudo dnf -y module disable container-tools
+sudo dnf -y install 'dnf-command(copr)'
+sudo dnf -y copr enable rhcontainerbot/container-selinux
+sudo curl -L -o /etc/yum.repos.d/devel:kubic:libcontainers:stable.repo https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/CentOS_8_Stream/devel:kubic:libcontainers:stable.repo
+sudo dnf -y install buildah
+```
+
+
+#### [Debian](https://debian.org)
+
+The buildah package is available in
+the [Bullseye (testing) branch](https://packages.debian.org/bullseye/buildah), which
+will be the next stable release (Debian 11) as well as Debian Unstable/Sid.
+
+```bash
+# Debian Testing/Bullseye or Unstable/Sid
+sudo apt-get update
+sudo apt-get -y install buildah
+```
+
+If you would prefer newer (though not as well-tested) packages,
+the [Kubic project](https://build.opensuse.org/package/show/devel:kubic:libcontainers:stable/buildah)
+provides packages for Debian 10 and newer. The packages in Kubic project repos are more frequently
+updated than the one in Debian's official repositories, due to how Debian works.
+The build sources for the Kubic packages can be found [here](https://gitlab.com/rhcontainerbot/buildah/-/tree/debian/debian).
+
+CAUTION: On Debian 11 and newer, including Testing and Sid/Unstable, we highly recommend you use Buildah, Podman and Skopeo ONLY from EITHER the Kubic repo
+OR the official Debian repos. Mixing and matching may lead to unpredictable situations including installation conflicts.
+
+```bash
+# Debian 10
+echo 'deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_10/ /' > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_10/Release.key | sudo apt-key add -
+sudo apt-get update
+sudo apt-get -y install buildah
+
+# Debian Testing
+echo 'deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_Testing/ /' > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_Testing/Release.key | sudo apt-key add -
+sudo apt-get update
+sudo apt-get -y install buildah
+
+# Debian Sid/Unstable
+echo 'deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_Unstable/ /' > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_Unstable/Release.key | sudo apt-key add -
+sudo apt-get update
+sudo apt-get -y install buildah
+```
+
+
+
+### [Fedora](https://www.fedoraproject.org)
+
+```bash
+sudo dnf -y install buildah
 ```
 
 ### [Fedora SilverBlue](https://silverblue.fedoraproject.org)
@@ -26,7 +116,7 @@ Not Available.  Must be installed via package layering.
 
 rpm-ostree install buildah
 
-Note: `[podman](https://podman.io) build` is available by default.
+Note: [`podman`](https://podman.io) build is available by default.
 
 ### [Gentoo](https://www.gentoo.org)
 
@@ -53,6 +143,28 @@ sudo subscription-manager repos --enable=rhel-7-server-extras-rpms
 sudo yum -y install buildah
 ```
 
+#### [Raspberry Pi OS armhf (ex Raspbian)](https://www.raspberrypi.org/downloads/raspberry-pi-os/)
+
+The [Kubic project](https://build.opensuse.org/package/show/devel:kubic:libcontainers:stable/buildah) provides
+packages for Raspbian 10.
+
+```bash
+# Raspbian 10
+echo 'deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Raspbian_10/ /' | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Raspbian_10/Release.key | sudo apt-key add -
+sudo apt-get update -qq
+sudo apt-get -qq -y install buildah
+```
+
+The build sources for the Kubic packages can be found [here](https://gitlab.com/rhcontainerbot/buildah/-/tree/debian/debian).
+
+#### [Raspberry Pi OS arm64 (beta)](https://downloads.raspberrypi.org/raspios_arm64/images/)
+
+Raspberry Pi OS use the standard Debian's repositories,
+so it is fully compatible with Debian's arm64 repository.
+You can simply follow the [steps for Debian](#debian) to install podman.
+
+
 ### [RHEL8 Beta](https://www.redhat.com/en/blog/powering-its-future-while-preserving-present-introducing-red-hat-enterprise-linux-8-beta?intcmp=701f2000001Cz6OAAS)
 
 ```bash
@@ -62,10 +174,31 @@ sudo yum module install -y buildah
 
 ### [Ubuntu](https://www.ubuntu.com)
 
+The buildah package is available in the official repositories for Ubuntu 20.10
+and newer.
+
 ```bash
-sudo apt-get update -qq
-sudo apt-get install -qq -y software-properties-common
-sudo add-apt-repository -y ppa:projectatomic/ppa
+# Ubuntu 20.10 and newer
+sudo apt-get -y update
+sudo apt-get -y install buildah
+```
+
+If you would prefer newer (though not as well-tested) packages,
+the [Kubic project](https://build.opensuse.org/package/show/devel:kubic:libcontainers:stable/buildah)
+provides packages for active Ubuntu releases 18.04 and newer (it should also work with direct derivatives like Pop!\_OS).
+The packages in Kubic project repos are more frequently updated than the one in Ubuntu's official repositories, due to how Debian/Ubuntu works.
+Checkout the Kubic project page for a list of supported Ubuntu version and architecture combinations.
+The build sources for the Kubic packages can be found [here](https://gitlab.com/rhcontainerbot/buildah/-/tree/debian/debian).
+
+CAUTION: On Ubuntu 20.10 and newer, we highly recommend you use Buildah, Podman and Skopeo ONLY from EITHER the Kubic repo
+OR the official Ubuntu repos. Mixing and matching may lead to unpredictable situations including installation conflicts.
+
+
+```bash
+. /etc/os-release
+sudo sh -c "echo 'deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/x${ID^}_${VERSION_ID}/ /' > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list"
+wget -nv https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/x${ID^}_${VERSION_ID}/Release.key -O Release.key
+sudo apt-key add - < Release.key
 sudo apt-get update -qq
 sudo apt-get -qq -y install buildah
 ```
@@ -107,9 +240,9 @@ named `containernetworking-cni`).  If not, they will need to be installed,
 for example using:
 ```
   git clone https://github.com/containernetworking/plugins
-  ( cd ./plugins; ./build.sh )
-  mkdir -p /opt/cni/bin
-  install -v ./plugins/bin/* /opt/cni/bin
+  ( cd ./plugins; ./build_linux.sh )
+  sudo mkdir -p /opt/cni/bin
+  sudo install -v ./plugins/bin/* /opt/cni/bin
 ```
 
 The CNI library needs to be configured so that it will know which plugins to
@@ -128,7 +261,7 @@ as yum, dnf or apt-get on a number of Linux distributions.
 
 Prior to installing Buildah, install the following packages on your Linux distro:
 * make
-* golang (Requires version 1.10 or higher.)
+* golang (Requires version 1.13 or higher.)
 * bats
 * btrfs-progs-devel
 * bzip2
@@ -139,7 +272,6 @@ Prior to installing Buildah, install the following packages on your Linux distro
 * glib2-devel
 * libassuan-devel
 * libseccomp-devel
-* ostree-devel
 * runc (Requires version 1.0 RC4 or higher.)
 * containers-common
 
@@ -158,7 +290,6 @@ In Fedora, you can use this command:
     gpgme-devel \
     libassuan-devel \
     libseccomp-devel \
-    ostree-devel \
     git \
     bzip2 \
     go-md2man \
@@ -196,7 +327,6 @@ run this command:
     gpgme-devel \
     libassuan-devel \
     libseccomp-devel \
-    ostree-devel \
     git \
     bzip2 \
     go-md2man \
@@ -236,13 +366,13 @@ The build steps for Buildah on SUSE / openSUSE are the same as for Fedora, above
 In Ubuntu zesty and xenial, you can use these commands:
 
 ```
-  apt-get -y install software-properties-common
-  add-apt-repository -y ppa:alexlarsson/flatpak
-  add-apt-repository -y ppa:gophers/archive
-  apt-add-repository -y ppa:projectatomic/ppa
-  apt-get -y -qq update
-  apt-get -y install bats btrfs-tools git libapparmor-dev libdevmapper-dev libglib2.0-dev libgpgme11-dev libostree-dev libseccomp-dev libselinux1-dev skopeo-containers go-md2man
-  apt-get -y install golang-1.10
+  sudo apt-get -y install software-properties-common
+  sudo add-apt-repository -y ppa:alexlarsson/flatpak
+  sudo add-apt-repository -y ppa:gophers/archive
+  sudo apt-add-repository -y ppa:projectatomic/ppa
+  sudo apt-get -y -qq update
+  sudo apt-get -y install bats btrfs-tools git libapparmor-dev libdevmapper-dev libglib2.0-dev libgpgme11-dev libseccomp-dev libselinux1-dev skopeo-containers go-md2man
+  sudo apt-get -y install golang-1.13
 ```
 Then to install Buildah on Ubuntu follow the steps in this example:
 
@@ -252,7 +382,7 @@ Then to install Buildah on Ubuntu follow the steps in this example:
   export GOPATH=`pwd`
   git clone https://github.com/containers/buildah ./src/github.com/containers/buildah
   cd ./src/github.com/containers/buildah
-  PATH=/usr/lib/go-1.10/bin:$PATH make runc all SECURITYTAGS="apparmor seccomp"
+  PATH=/usr/lib/go-1.13/bin:$PATH make runc all SECURITYTAGS="apparmor seccomp"
   sudo make install install.runc
   buildah --help
 ```
@@ -263,18 +393,18 @@ To install the required dependencies, you can use those commands, tested under D
 
 ```
 gpg --recv-keys 0x018BA5AD9DF57A4448F0E6CF8BECF1637AD8C79D
-gpg --export 0x018BA5AD9DF57A4448F0E6CF8BECF1637AD8C79D >> /usr/share/keyrings/projectatomic-ppa.gpg
-echo 'deb [signed-by=/usr/share/keyrings/projectatomic-ppa.gpg] http://ppa.launchpad.net/projectatomic/ppa/ubuntu zesty main' > /etc/apt/sources.list.d/projectatomic-ppa.list
-apt update
-apt -y install -t stretch-backports libostree-dev golang
-apt -y install bats btrfs-tools git libapparmor-dev libdevmapper-dev libglib2.0-dev libgpgme11-dev libseccomp-dev libselinux1-dev skopeo-containers go-md2man
+sudo gpg --export 0x018BA5AD9DF57A4448F0E6CF8BECF1637AD8C79D >> /usr/share/keyrings/projectatomic-ppa.gpg
+sudo echo 'deb [signed-by=/usr/share/keyrings/projectatomic-ppa.gpg] http://ppa.launchpad.net/projectatomic/ppa/ubuntu zesty main' > /etc/apt/sources.list.d/projectatomic-ppa.list
+sudo apt update
+sudo apt -y install -t stretch-backports golang
+sudo apt -y install bats btrfs-tools git libapparmor-dev libdevmapper-dev libglib2.0-dev libgpgme11-dev libseccomp-dev libselinux1-dev skopeo-containers go-md2man
 ```
 
 The build steps on Debian are otherwise the same as Ubuntu, above.
 
 ## Vendoring - Dependency Management
 
-This project is using [go modules](https://github.com/golang/go/wiki/Modules) for dependency management.  If the CI is complaining about a pull request leaving behind an unclean state, it is very likely right about it.  After changing dependencies, make sure to run `make vendor` to synchronize the code with the go module and repopulate the `./vendor` directory.
+This project is using [go modules](https://github.com/golang/go/wiki/Modules) for dependency management.  If the CI is complaining about a pull request leaving behind an unclean state, it is very likely right about it.  After changing dependencies, make sure to run `make vendor-in-container` to synchronize the code with the go module and repopulate the `./vendor` directory.
 
 ## Configuration files
 
@@ -343,7 +473,7 @@ cat /usr/share/containers/mounts.conf
 
 `/usr/share/containers/seccomp.json`
 
-seccomp.json contains the whitelist of seccomp rules to be allowed inside of
+seccomp.json contains the list of seccomp rules to be allowed inside of
 containers.  This file is usually provided by the containers-common package.
 
 The link above takes you to the seccomp.json
@@ -375,13 +505,22 @@ cat /etc/containers/policy.json
 }
 ```
 
+## Debug with Delve and the like
+
+To make a source debug build without optimizations use `DEBUG=1`, like:
+```
+make all DEBUG=1
+```
+
 ## Vendoring
 
-Buildah uses Go Modules for vendoring purposes.  If you need to update or add a vendored package into Buildah, please follow this proceedure:
+Buildah uses Go Modules for vendoring purposes.  If you need to update or add a vendored package into Buildah, please follow this procedure:
  * Enter into your sandbox `src/github.com/containers/buildah` and ensure that the GOPATH variable is set to the directory prior as noted above.
  * `export GO111MODULE=on`
- * Assuming you want to 'bump' the `github.com/containers/storage` package to version 1.12.13, use this command: `go get github.com/containers/storage@v1.12.13`
- * `make vendor`
+ * `go get` the needed version:
+     * Assuming you want to 'bump' the `github.com/containers/storage` package to version 1.12.13, use this command: `go get github.com/containers/storage@v1.12.13`
+     *  Assuming that you want to 'bump' the `github.com/containers/storage` package to a particular commit, use this command: `go get github.com/containers/storage@e307568568533c4afccdf7b56df7b4493e4e9a7b`
+ * `make vendor-in-container`
  * `make`
  * `make install`
  * Then add any updated or added files with `git add` then do a `git commit` and create a PR.
@@ -391,10 +530,10 @@ Buildah uses Go Modules for vendoring purposes.  If you need to update or add a 
 If you wish to vendor in your personal fork to try changes out (assuming containers/storage in the below example):
 
  * `go mod edit -replace github.com/containers/storage=github.com/{mygithub_username}/storage@YOUR_BRANCH`
- * `make vendor`
+ * `make vendor-in-container`
 
 To revert
  * `go mod edit -dropreplace github.com/containers/storage`
- * `make vendor`
+ * `make vendor-in-container`
 
 To speed up fetching dependencies, you can use a [Go Module Proxy](https://proxy.golang.org) by setting `GOPROXY=https://proxy.golang.org`.

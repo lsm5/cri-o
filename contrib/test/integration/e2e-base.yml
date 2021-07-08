@@ -50,9 +50,10 @@
     daemon_reload: yes
 
 - name: wait for the cluster to be running
-  command: "{{ ansible_env.GOPATH }}/src/k8s.io/kubernetes/_output/bin/kubectl get service kubernetes --namespace default"
+  # ref: https://kubernetes.io/docs/reference/kubectl/cheatsheet/
+  shell: "{{ ansible_env.GOPATH }}/src/k8s.io/kubernetes/_output/bin/kubectl get nodes -o jsonpath='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}' 2>&1 | grep 'Ready=True'"
   register: kube_poll
-  until: kube_poll | succeeded
+  until: kube_poll.rc == 0
   retries: 100
   delay: 30
 
@@ -71,4 +72,7 @@
   command: modprobe br_netfilter
 
 - name: Enable iptables NAT for the bridge
-  command: sysctl -w net.bridge.bridge-nf-call-iptables=1
+  sysctl:
+    name: net.bridge.bridge-nf-call-iptables
+    value: 1
+    state: present

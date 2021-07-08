@@ -4,11 +4,11 @@ import (
 	"context"
 
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/golang/mock/gomock"
+	"github.com/cri-o/cri-o/server/cri/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // The actual test suite
@@ -25,41 +25,62 @@ var _ = t.Describe("UpdateContainerResources", func() {
 	t.Describe("UpdateContainerResources", func() {
 		It("should succeed", func() {
 			// Given
-			addContainerAndSandbox()
+			testContainer.SetSpec(&specs.Spec{
+				Linux: &specs.Linux{
+					Resources: &specs.LinuxResources{},
+				},
+			})
 			testContainer.SetState(&oci.ContainerState{
 				State: specs.State{Status: oci.ContainerStateRunning},
 			})
+			addContainerAndSandbox()
 
 			// When
-			response, err := sut.UpdateContainerResources(context.Background(),
-				&pb.UpdateContainerResourcesRequest{
-					ContainerId: testContainer.ID()})
+			err := sut.UpdateContainerResources(context.Background(),
+				&types.UpdateContainerResourcesRequest{
+					ContainerID: testContainer.ID(),
+				},
+			)
 
 			// Then
 			Expect(err).To(BeNil())
-			Expect(response).NotTo(BeNil())
 		})
 
-		It("should fail if update container erros", func() {
+		It("should update the container spec", func() {
 			// Given
-			sut.SetRuntime(ociRuntimeMock)
-			addContainerAndSandbox()
+			testContainer.SetSpec(&specs.Spec{
+				Linux: &specs.Linux{
+					Resources: &specs.LinuxResources{},
+				},
+			})
 			testContainer.SetState(&oci.ContainerState{
 				State: specs.State{Status: oci.ContainerStateRunning},
 			})
-			gomock.InOrder(
-				ociRuntimeMock.EXPECT().UpdateContainer(gomock.Any(),
-					gomock.Any()).Return(t.TestError),
-			)
+			addContainerAndSandbox()
 
 			// When
-			response, err := sut.UpdateContainerResources(context.Background(),
-				&pb.UpdateContainerResourcesRequest{
-					ContainerId: testContainer.ID()})
+			err := sut.UpdateContainerResources(context.Background(),
+				&types.UpdateContainerResourcesRequest{
+					ContainerID: testContainer.ID(),
+					Linux: &types.LinuxContainerResources{
+						CPUPeriod:  100000,
+						CPUQuota:   20000,
+						CPUShares:  1024,
+						CPUsetCPUs: "0-3,12-15",
+						CPUsetMems: "0,1",
+					},
+				},
+			)
 
 			// Then
-			Expect(err).NotTo(BeNil())
-			Expect(response).To(BeNil())
+			Expect(err).To(BeNil())
+
+			c := sut.GetContainer(testContainer.ID())
+			Expect(int(*c.Spec().Linux.Resources.CPU.Period)).To(Equal(100000))
+			Expect(int(*c.Spec().Linux.Resources.CPU.Quota)).To(Equal(20000))
+			Expect(int(*c.Spec().Linux.Resources.CPU.Shares)).To(Equal(1024))
+			Expect(c.Spec().Linux.Resources.CPU.Cpus).To(Equal("0-3,12-15"))
+			Expect(c.Spec().Linux.Resources.CPU.Mems).To(Equal("0,1"))
 		})
 
 		It("should fail when container is not in created/running state", func() {
@@ -67,36 +88,35 @@ var _ = t.Describe("UpdateContainerResources", func() {
 			addContainerAndSandbox()
 
 			// When
-			response, err := sut.UpdateContainerResources(context.Background(),
-				&pb.UpdateContainerResourcesRequest{
-					ContainerId: testContainer.ID()})
+			err := sut.UpdateContainerResources(context.Background(),
+				&types.UpdateContainerResourcesRequest{
+					ContainerID: testContainer.ID(),
+				})
 
 			// Then
 			Expect(err).NotTo(BeNil())
-			Expect(response).To(BeNil())
 		})
 
 		It("should fail with invalid container id", func() {
 			// Given
 			// When
-			response, err := sut.UpdateContainerResources(context.Background(),
-				&pb.UpdateContainerResourcesRequest{
-					ContainerId: testContainer.ID()})
+			err := sut.UpdateContainerResources(context.Background(),
+				&types.UpdateContainerResourcesRequest{
+					ContainerID: testContainer.ID(),
+				})
 
 			// Then
 			Expect(err).NotTo(BeNil())
-			Expect(response).To(BeNil())
 		})
 
 		It("should fail with empty container ID", func() {
 			// Given
 			// When
-			response, err := sut.UpdateContainerResources(context.Background(),
-				&pb.UpdateContainerResourcesRequest{})
+			err := sut.UpdateContainerResources(context.Background(),
+				&types.UpdateContainerResourcesRequest{})
 
 			// Then
 			Expect(err).NotTo(BeNil())
-			Expect(response).To(BeNil())
 		})
 	})
 })

@@ -12,8 +12,5 @@ function teardown() {
 
 @test "crictl runtimeversion" {
 	start_crio
-	run crictl info
-	echo "$output"
-	[ "$status" -eq 0 ]
-	stop_crio
+	crictl info
 }

@@ -8,17 +8,16 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/docker/docker/pkg/pools"
-	"github.com/docker/docker/pkg/term"
-	"github.com/kr/pty"
-	"github.com/opencontainers/runc/libcontainer"
+	"github.com/containers/podman/v3/pkg/cgroups"
+	"github.com/containers/storage/pkg/pools"
+	"github.com/creack/pty"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"k8s.io/client-go/tools/remotecommand"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
-func kill(pid int) error {
+func Kill(pid int) error {
 	err := unix.Kill(pid, unix.SIGKILL)
 	if err != nil && err != unix.ESRCH {
 		return fmt.Errorf("failed to kill process: %v", err)
@@ -26,18 +25,8 @@ func kill(pid int) error {
 	return nil
 }
 
-func getExitCode(err error) int32 {
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if status, ok := exitErr.Sys().(unix.WaitStatus); ok {
-			return int32(status.ExitStatus())
-		}
-	}
-	return -1
-}
-
-func calculateCPUPercent(stats *libcontainer.Stats) float64 {
-	return genericCalculateCPUPercent(stats.CgroupStats.CpuStats.CpuUsage.TotalUsage,
-		stats.CgroupStats.CpuStats.CpuUsage.PercpuUsage)
+func calculateCPUPercent(stats *cgroups.Metrics) float64 {
+	return genericCalculateCPUPercent(stats.CPU.Usage.Total, stats.CPU.Usage.PerCPU)
 }
 
 func genericCalculateCPUPercent(cpuTotal uint64, perCPU []uint64) float64 {
@@ -55,7 +44,8 @@ func genericCalculateCPUPercent(cpuTotal uint64, perCPU []uint64) float64 {
 }
 
 func setSize(fd uintptr, size remotecommand.TerminalSize) error {
-	return term.SetWinsize(fd, &term.Winsize{Height: size.Height, Width: size.Width})
+	winsize := &unix.Winsize{Row: size.Height, Col: size.Width}
+	return unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, winsize)
 }
 
 func ttyCmd(execCmd *exec.Cmd, stdin io.Reader, stdout io.WriteCloser, resize <-chan remotecommand.TerminalSize) error {
@@ -70,7 +60,7 @@ func ttyCmd(execCmd *exec.Cmd, stdin io.Reader, stdout io.WriteCloser, resize <-
 
 	kubecontainer.HandleResizing(resize, func(size remotecommand.TerminalSize) {
 		if err := setSize(p.Fd(), size); err != nil {
-			logrus.Warnf("unable to set terminal size: %v", err)
+			logrus.Warnf("Unable to set terminal size: %v", err)
 		}
 	})
 
@@ -86,10 +76,10 @@ func ttyCmd(execCmd *exec.Cmd, stdin io.Reader, stdout io.WriteCloser, resize <-
 	err = execCmd.Wait()
 
 	if stdinErr != nil {
-		logrus.Warnf("stdin copy error: %v", stdinErr)
+		logrus.Warnf("Stdin copy error: %v", stdinErr)
 	}
 	if stdoutErr != nil {
-		logrus.Warnf("stdout copy error: %v", stdoutErr)
+		logrus.Warnf("Stdout copy error: %v", stdoutErr)
 	}
 
 	return err

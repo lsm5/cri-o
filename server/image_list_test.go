@@ -3,12 +3,13 @@ package server_test
 import (
 	"context"
 
-	"github.com/cri-o/cri-o/internal/pkg/storage"
+	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/server"
+	"github.com/cri-o/cri-o/server/cri/types"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"github.com/opencontainers/go-digest"
 )
 
 // The actual test suite
@@ -30,18 +31,19 @@ var _ = t.Describe("ImageList", func() {
 				imageServerMock.EXPECT().ListImages(
 					gomock.Any(), gomock.Any()).
 					Return([]storage.ImageResult{
-						{ID: imageID, Size: &size, User: "10"}}, nil),
+						{ID: imageID, Size: &size, User: "10"},
+					}, nil),
 			)
 
 			// When
 			response, err := sut.ListImages(context.Background(),
-				&pb.ListImagesRequest{})
+				&types.ListImagesRequest{})
 
 			// Then
 			Expect(err).To(BeNil())
 			Expect(response).NotTo(BeNil())
 			Expect(len(response.Images)).To(BeEquivalentTo(1))
-			Expect(response.Images[0].GetId()).To(Equal(imageID))
+			Expect(response.Images[0].ID).To(Equal(imageID))
 		})
 
 		It("should succed with filter", func() {
@@ -54,8 +56,9 @@ var _ = t.Describe("ImageList", func() {
 
 			// When
 			response, err := sut.ListImages(context.Background(),
-				&pb.ListImagesRequest{Filter: &pb.ImageFilter{
-					Image: &pb.ImageSpec{Image: "image"}}})
+				&types.ListImagesRequest{Filter: &types.ImageFilter{
+					Image: &types.ImageSpec{Image: "image"},
+				}})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -63,7 +66,7 @@ var _ = t.Describe("ImageList", func() {
 			Expect(len(response.Images)).To(BeEquivalentTo(1))
 		})
 
-		It("should fail when image listing erros", func() {
+		It("should fail when image listing errors", func() {
 			// Given
 			gomock.InOrder(
 				imageServerMock.EXPECT().ListImages(gomock.Any(),
@@ -72,7 +75,7 @@ var _ = t.Describe("ImageList", func() {
 
 			// When
 			response, err := sut.ListImages(context.Background(),
-				&pb.ListImagesRequest{})
+				&types.ListImagesRequest{})
 
 			// Then
 			Expect(err).NotTo(BeNil())
@@ -90,10 +93,8 @@ var _ = t.Describe("ImageList", func() {
 
 			// Then
 			Expect(result).NotTo(BeNil())
-			Expect(result.RepoTags).To(HaveLen(1))
-			Expect(result.RepoTags).To(ContainElement("<none>:<none>"))
-			Expect(result.RepoDigests).To(HaveLen(1))
-			Expect(result.RepoDigests).To(ContainElement("<none>@<none>"))
+			Expect(result.RepoTags).To(HaveLen(0))
+			Expect(result.RepoDigests).To(HaveLen(0))
 		})
 
 		It("should succeed with repo tags and digests", func() {
@@ -115,8 +116,25 @@ var _ = t.Describe("ImageList", func() {
 			Expect(result.RepoTags).To(ConsistOf("1", "2"))
 			Expect(result.RepoDigests).To(HaveLen(2))
 			Expect(result.RepoDigests).To(ConsistOf("3", "4"))
-			Expect(result.Size_).To(Equal(size))
-			Expect(result.Uid.Value).To(BeEquivalentTo(10))
+			Expect(result.Size).To(Equal(size))
+			Expect(result.UID.Value).To(BeEquivalentTo(10))
+		})
+
+		It("should succeed with previous tag but no current", func() {
+			// Given
+			image := &storage.ImageResult{
+				PreviousName: "1",
+				Digest:       digest.Digest("2"),
+			}
+
+			// When
+			result := server.ConvertImage(image)
+
+			// Then
+			Expect(result).NotTo(BeNil())
+			Expect(result.RepoTags).To(HaveLen(0))
+			Expect(result.RepoDigests).To(HaveLen(1))
+			Expect(result.RepoDigests).To(ContainElement("1@2"))
 		})
 
 		It("should return nil if input image is nil", func() {

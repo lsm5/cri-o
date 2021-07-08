@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/cri-o/cri-o/internal/client"
-	"github.com/cri-o/cri-o/internal/pkg/criocli"
+	"github.com/cri-o/cri-o/internal/criocli"
 	"github.com/cri-o/cri-o/internal/version"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
 const (
@@ -20,84 +20,52 @@ const (
 func main() {
 	app := cli.NewApp()
 	app.Name = "crio-status"
-	app.Authors = []cli.Author{
-		{Name: "Sascha Grunert", Email: "sgrunert@suse.com"},
-	}
-	app.Author = app.Authors[0].Name
+	app.Authors = []*cli.Author{{Name: "The CRI-O Maintainers"}}
 	app.Usage = "A tool for CRI-O status retrieval"
 	app.Description = app.Usage
-	app.Version = version.Version
+	app.Version = version.Get().Version
 	app.CommandNotFound = func(*cli.Context, string) { os.Exit(1) }
 	app.OnUsageError = func(c *cli.Context, e error, b bool) error { return e }
 	app.Action = func(c *cli.Context) error {
 		return fmt.Errorf("expecting a valid subcommand")
 	}
 
-	flags := []cli.Flag{
-		cli.StringFlag{
-			Name: socketArg + ", s",
-			Usage: fmt.Sprintf(
-				"absolute path to the unix socket (default: %q)",
-				defaultSocket,
-			),
+	app.Flags = []cli.Flag{
+		&cli.StringFlag{
+			Name:      socketArg,
+			Aliases:   []string{"s"},
+			Usage:     "absolute path to the unix socket",
+			Value:     defaultSocket,
 			TakesFile: true,
 		},
 	}
-	app.Flags = flags
-	app.Commands = []cli.Command{criocli.Completion, {
+	app.Commands = criocli.DefaultCommands
+	app.Commands = append(app.Commands, []*cli.Command{{
 		Action:  config,
 		Aliases: []string{"c"},
-		Flags:   flags,
 		Name:    "config",
 		Usage:   "Show the configuration of CRI-O as TOML string.",
 	}, {
 		Action:  containers,
 		Aliases: []string{"container", "cs", "s"},
-		Flags: append(flags, cli.StringFlag{
-			Name:  idArg + ", i",
-			Usage: "the container ID",
-		}),
+		Flags: []cli.Flag{&cli.StringFlag{
+			Name:    idArg,
+			Aliases: []string{"i"},
+			Usage:   "the container ID",
+		}},
 		Name:  "containers",
 		Usage: "Display detailed information about the provided container ID.",
 	}, {
 		Action:  info,
 		Aliases: []string{"i"},
-		Flags:   flags,
 		Name:    "info",
 		Usage:   "Retrieve generic information about CRI-O, like the cgroup and storage driver.",
-	}, {
-		Action: man,
-		Name:   "man",
-		Usage:  "Generate the man page documentation.",
-	}, {
-		Action:  markdown,
-		Name:    "markdown",
-		Aliases: []string{"md"},
-		Usage:   "Generate the markdown documentation.",
-	}}
+	}}...)
 
 	if err := app.Run(os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func man(c *cli.Context) error {
-	res, err := c.App.ToMan()
-	if err != nil {
-		return err
-	}
-	fmt.Print(res)
-	return nil
-}
-
-func markdown(c *cli.Context) error {
-	res, err := c.App.ToMarkdown()
-	if err != nil {
-		return err
-	}
-	fmt.Print(strings.TrimSpace(res))
-	return nil
 }
 
 func config(c *cli.Context) error {
@@ -184,11 +152,5 @@ func info(c *cli.Context) error {
 }
 
 func crioClient(c *cli.Context) (client.CrioClient, error) {
-	socket := defaultSocket
-	if c.GlobalString(socketArg) != "" {
-		socket = c.GlobalString(socketArg)
-	} else if c.String(socketArg) != "" {
-		socket = c.String(socketArg)
-	}
-	return client.New(socket)
+	return client.New(c.String(socketArg))
 }

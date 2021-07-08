@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,14 +16,16 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/containers/buildah/bind"
-	"github.com/containers/buildah/pkg/unshare"
+	"github.com/containers/buildah/copier"
 	"github.com/containers/buildah/util"
 	"github.com/containers/storage/pkg/ioutils"
 	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/reexec"
+	"github.com/containers/storage/pkg/unshare"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -201,6 +204,11 @@ func runUsingChrootMain() {
 	defer confPipe.Close()
 	if err := json.NewDecoder(confPipe).Decode(&options); err != nil {
 		fmt.Fprintf(os.Stderr, "error decoding options: %v\n", err)
+		os.Exit(1)
+	}
+
+	if options.Spec == nil {
+		fmt.Fprintf(os.Stderr, "invalid options spec in runUsingChrootMain\n")
 		os.Exit(1)
 	}
 
@@ -655,6 +663,11 @@ func runUsingChrootExecMain() {
 	// Set the hostname.  We're already in a distinct UTS namespace and are admins in the user
 	// namespace which created it, so we shouldn't get a permissions error, but seccomp policy
 	// might deny our attempt to call sethostname() anyway, so log a debug message for that.
+	if options.Spec == nil {
+		fmt.Fprintf(os.Stderr, "invalid options spec passed in\n")
+		os.Exit(1)
+	}
+
 	if options.Spec.Hostname != "" {
 		if err := unix.Sethostname([]byte(options.Spec.Hostname)); err != nil {
 			logrus.Debugf("failed to set hostname %q for process: %v", options.Spec.Hostname, err)
@@ -740,10 +753,13 @@ func runUsingChrootExecMain() {
 			os.Exit(1)
 		}
 	} else {
-		logrus.Debugf("clearing supplemental groups")
-		if err = syscall.Setgroups([]int{}); err != nil {
-			fmt.Fprintf(os.Stderr, "error clearing supplemental groups list: %v", err)
-			os.Exit(1)
+		setgroups, _ := ioutil.ReadFile("/proc/self/setgroups")
+		if strings.Trim(string(setgroups), "\n") != "deny" {
+			logrus.Debugf("clearing supplemental groups")
+			if err = syscall.Setgroups([]int{}); err != nil {
+				fmt.Fprintf(os.Stderr, "error clearing supplemental groups list: %v", err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -1002,12 +1018,19 @@ func isDevNull(dev os.FileInfo) bool {
 // callback that will clean up its work.
 func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func() error, err error) {
 	var fs unix.Statfs_t
-	removes := []string{}
 	undoBinds = func() error {
-		if err2 := bind.UnmountMountpoints(spec.Root.Path, removes); err2 != nil {
-			logrus.Warnf("pkg/chroot: error unmounting %q: %v", spec.Root.Path, err2)
-			if err == nil {
-				err = err2
+		if err2 := unix.Unmount(spec.Root.Path, unix.MNT_DETACH); err2 != nil {
+			retries := 0
+			for (err2 == unix.EBUSY || err2 == unix.EAGAIN) && retries < 50 {
+				time.Sleep(50 * time.Millisecond)
+				err2 = unix.Unmount(spec.Root.Path, unix.MNT_DETACH)
+				retries++
+			}
+			if err2 != nil {
+				logrus.Warnf("pkg/chroot: error unmounting %q (retried %d times): %v", spec.Root.Path, retries, err2)
+				if err == nil {
+					err = err2
+				}
 			}
 		}
 		return err
@@ -1025,7 +1048,7 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 	subDev := filepath.Join(spec.Root.Path, "/dev")
 	if err := unix.Mount("/dev", subDev, "bind", devFlags, ""); err != nil {
 		if os.IsNotExist(err) {
-			err = os.Mkdir(subDev, 0700)
+			err = os.Mkdir(subDev, 0755)
 			if err == nil {
 				err = unix.Mount("/dev", subDev, "bind", devFlags, "")
 			}
@@ -1049,7 +1072,7 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 	subProc := filepath.Join(spec.Root.Path, "/proc")
 	if err := unix.Mount("/proc", subProc, "bind", procFlags, ""); err != nil {
 		if os.IsNotExist(err) {
-			err = os.Mkdir(subProc, 0700)
+			err = os.Mkdir(subProc, 0755)
 			if err == nil {
 				err = unix.Mount("/proc", subProc, "bind", procFlags, "")
 			}
@@ -1064,7 +1087,7 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 	subSys := filepath.Join(spec.Root.Path, "/sys")
 	if err := unix.Mount("/sys", subSys, "bind", sysFlags, ""); err != nil {
 		if os.IsNotExist(err) {
-			err = os.Mkdir(subSys, 0700)
+			err = os.Mkdir(subSys, 0755)
 			if err == nil {
 				err = unix.Mount("/sys", subSys, "bind", sysFlags, "")
 			}
@@ -1085,7 +1108,13 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 		}
 		subSys := filepath.Join(spec.Root.Path, m.Mountpoint)
 		if err := unix.Mount(m.Mountpoint, subSys, "bind", sysFlags, ""); err != nil {
-			return undoBinds, errors.Wrapf(err, "error bind mounting /sys from host into mount namespace")
+			msg := fmt.Sprintf("could not bind mount %q, skipping: %v", m.Mountpoint, err)
+			if strings.HasPrefix(m.Mountpoint, "/sys") {
+				logrus.Infof(msg)
+			} else {
+				logrus.Warningf(msg)
+			}
+			continue
 		}
 		if err := makeReadOnly(subSys, sysFlags); err != nil {
 			return undoBinds, err
@@ -1093,9 +1122,6 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 	}
 	logrus.Debugf("bind mounted %q to %q", "/sys", filepath.Join(spec.Root.Path, "/sys"))
 
-	// Add /sys/fs/selinux to the set of masked paths, to ensure that we don't have processes
-	// attempting to interact with labeling, when they aren't allowed to do so.
-	spec.Linux.MaskedPaths = append(spec.Linux.MaskedPaths, "/sys/fs/selinux")
 	// Bind mount in everything we've been asked to mount.
 	for _, m := range spec.Mounts {
 		// Skip anything that we just mounted.
@@ -1136,28 +1162,36 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 			}
 		}
 		target := filepath.Join(spec.Root.Path, m.Destination)
-		if _, err := os.Stat(target); err != nil {
+		// Check if target is a symlink
+		stat, err := os.Lstat(target)
+		// If target is a symlink, follow the link and ensure the destination exists
+		if err == nil && stat != nil && (stat.Mode()&os.ModeSymlink != 0) {
+			target, err = copier.Eval(spec.Root.Path, m.Destination, copier.EvalOptions{})
+			if err != nil {
+				return nil, errors.Wrapf(err, "evaluating symlink %q", target)
+			}
+			// Stat the destination of the evaluated symlink
+			_, err = os.Stat(target)
+		}
+		if err != nil {
 			// If the target can't be stat()ted, check the error.
 			if !os.IsNotExist(err) {
 				return undoBinds, errors.Wrapf(err, "error examining %q for mounting in mount namespace", target)
 			}
-			// The target isn't there yet, so create it, and make a
-			// note to remove it later.
+			// The target isn't there yet, so create it.
 			if srcinfo.IsDir() {
-				if err = os.MkdirAll(target, 0111); err != nil {
+				if err = os.MkdirAll(target, 0755); err != nil {
 					return undoBinds, errors.Wrapf(err, "error creating mountpoint %q in mount namespace", target)
 				}
-				removes = append(removes, target)
 			} else {
-				if err = os.MkdirAll(filepath.Dir(target), 0111); err != nil {
+				if err = os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 					return undoBinds, errors.Wrapf(err, "error ensuring parent of mountpoint %q (%q) is present in mount namespace", target, filepath.Dir(target))
 				}
 				var file *os.File
-				if file, err = os.OpenFile(target, os.O_WRONLY|os.O_CREATE, 0); err != nil {
+				if file, err = os.OpenFile(target, os.O_WRONLY|os.O_CREATE, 0755); err != nil {
 					return undoBinds, errors.Wrapf(err, "error creating mountpoint %q in mount namespace", target)
 				}
 				file.Close()
-				removes = append(removes, target)
 			}
 		}
 		requestFlags := bindFlags
@@ -1266,7 +1300,6 @@ func setupChrootBindMounts(spec *specs.Spec, bundlePath string) (undoBinds func(
 		if err := os.Mkdir(roEmptyDir, 0700); err != nil {
 			return undoBinds, errors.Wrapf(err, "error creating empty directory %q", roEmptyDir)
 		}
-		removes = append(removes, roEmptyDir)
 	}
 
 	// Set up any masked paths that we need to.  If we're running inside of

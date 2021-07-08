@@ -1,101 +1,61 @@
-{ revision ? "HEAD", system ? builtins.currentSystem }:
+{ system ? builtins.currentSystem }:
 let
-  nixpkgs = import ./nixpkgs.nix;
-
-  glibcPkgs = import (builtins.head nixpkgs) {
-    config = { packageOverrides = pkg: { go_1_11 = glibcPkgs.go_1_12; }; };
-  };
-
-  muslPkgs = (import (builtins.head nixpkgs) {
+  pkgs = (import ./nixpkgs.nix {
     config = {
       packageOverrides = pkg: {
-        go_bootstrap = pkg.go_bootstrap.overrideAttrs (old: {
-          installPhase = ''
-            sed -i 's/TestChown/testChown/' src/os/os_unix_test.go
-          '' + old.installPhase;
+        gpgme = (static pkg.gpgme);
+        libassuan = (static pkg.libassuan);
+        libgpgerror = (static pkg.libgpgerror);
+        libseccomp = (static pkg.libseccomp);
+        glib = (static pkg.glib).overrideAttrs(x: {
+          outputs = [ "bin" "out" "dev" ];
+          mesonFlags = [
+            "-Ddefault_library=static"
+            "-Ddevbindir=${placeholder ''dev''}/bin"
+            "-Dgtk_doc=false"
+            "-Dnls=disabled"
+          ];
         });
-        go_1_11 = muslPkgs.go_1_12;
-        go_1_12 = pkg.go_1_12.overrideAttrs (old: {
-          prePatch = ''
-            sed -i 's/TestChown/testChown/' src/os/os_unix_test.go
-            sed -i 's/TestFileChown/testFileChown/' src/os/os_unix_test.go
-            sed -i 's/TestLchown/testLchown/' src/os/os_unix_test.go
-            sed -i 's/TestCoverageUsesAtomicModeForRace/testCoverageUsesAtomicModeForRace/' src/cmd/go/go_test.go
-            sed -i 's/TestTestRaceInstall/testTestRaceInstall/' src/cmd/go/go_test.go
-            sed -i 's/TestGoTestRaceFailures/testGoTestRaceFailures/' src/cmd/go/go_test.go
-            sed -i '/func cmdtest/a return' src/cmd/dist/test.go
-          '' + old.prePatch;
-        });
-        gnupg = glibcPkgs.gnupg;
-        systemd = (import (builtins.elemAt nixpkgs 1) {}).systemd;
       };
     };
-  }).pkgsMusl;
+  });
 
-  static = pkg: pkg.overrideAttrs(old: {
-    configureFlags = (old.configureFlags or []) ++
-      [ "--without-shared" "--disable-shared" ];
+  static = pkg: pkg.overrideAttrs(x: {
+    doCheck = false;
+    configureFlags = (x.configureFlags or []) ++ [
+      "--without-shared"
+      "--disable-shared"
+    ];
     dontDisableStatic = true;
     enableSharedExecutables = false;
     enableStatic = true;
   });
 
-  patchLvm2 = pkg: pkg.overrideAttrs(old: {
-    configureFlags = [
-      "--disable-cmdlib" "--disable-readline" "--disable-udev_rules"
-      "--disable-udev_sync" "--enable-pkgconfig" "--enable-static_link"
-    ];
-    preConfigure = old.preConfigure + ''
-      substituteInPlace libdm/Makefile.in --replace \
-        SUBDIRS=dm-tools SUBDIRS=
-      substituteInPlace tools/Makefile.in --replace \
-        "TARGETS += lvm.static" ""
-      substituteInPlace tools/Makefile.in --replace \
-        "INSTALL_LVM_TARGETS += install_tools_static" ""
+  self = with pkgs; buildGoModule rec {
+    name = "cri-o";
+    src = ./..;
+    vendorSha256 = null;
+    doCheck = false;
+    enableParallelBuilding = true;
+    outputs = [ "out" ];
+    nativeBuildInputs = [ bash gitMinimal go-md2man installShellFiles makeWrapper pkg-config which ];
+    buildInputs = [ glibc glibc.static gpgme libassuan libgpgerror libseccomp libapparmor libselinux ];
+    prePatch = ''
+      export CFLAGS='-static -pthread'
+      export LDFLAGS='-s -w -static-libgcc -static'
+      export EXTRA_LDFLAGS='-s -w -linkmode external -extldflags "-static -lm"'
+      export BUILDTAGS='static netgo osusergo exclude_graphdriver_btrfs exclude_graphdriver_devicemapper seccomp apparmor selinux'
     '';
-    postInstall = "";
-  });
-
-  # TODO: remove the build phase patch after CRI-O 1.16.0 release in nixpkgs
-  patchBuildPhase = pkg: pkg.overrideDerivation(old: {
     buildPhase = ''
-      pushd go/src/${old.goPackagePath}
-      make -C pause
-      go build -tags ${old.makeFlags} -o bin/crio -buildmode=pie \
-        -ldflags '-s -w -linkmode external -extldflags "-static -lm"' \
-        ${old.goPackagePath}/cmd/crio
+      patchShebangs .
+      make bin/crio
+      make bin/crio-status
+      make bin/pinns
     '';
-  });
-
-  self = {
-    cri-o-static-musl = patchBuildPhase ((muslPkgs.cri-o.overrideAttrs(old: {
-      name = "cri-o-x86_64-static-musl-${revision}";
-      buildInputs = old.buildInputs ++ [ muslPkgs.systemd ];
-      src = ./..;
-    })).override {
-      flavor = "-x86_64-static-musl";
-      ldflags = ''-linkmode external -extldflags "-static"'';
-
-      glibc = null;
-      gpgme = (static muslPkgs.gpgme);
-      libassuan = (static muslPkgs.libassuan);
-      libgpgerror = (static muslPkgs.libgpgerror);
-      libseccomp = (static muslPkgs.libseccomp);
-      lvm2 = (patchLvm2 (static muslPkgs.lvm2));
-    });
-    cri-o-static-glibc = patchBuildPhase ((glibcPkgs.cri-o.overrideAttrs(old: {
-      name = "cri-o-x86_64-static-glibc-${revision}";
-      buildInputs = old.buildInputs ++ [ glibcPkgs.systemd ];
-      src = ./..;
-    })).override {
-      flavor = "-x86_64-static-glibc";
-      ldflags = ''-linkmode external -extldflags "-static -lm"'';
-
-      gpgme = (static glibcPkgs.gpgme);
-      libassuan = (static glibcPkgs.libassuan);
-      libgpgerror = (static glibcPkgs.libgpgerror);
-      libseccomp = (static glibcPkgs.libseccomp);
-      lvm2 = (patchLvm2 (static glibcPkgs.lvm2));
-    });
+    installPhase = ''
+      install -Dm755 bin/crio $out/bin/crio
+      install -Dm755 bin/crio-status $out/bin/crio-status
+      install -Dm755 bin/pinns $out/bin/pinns
+    '';
   };
 in self

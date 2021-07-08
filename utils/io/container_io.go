@@ -72,7 +72,7 @@ func WithNewFIFOs(root string, tty, stdin bool) ContainerIOOpts {
 }
 
 // NewContainerIO creates container io.
-func NewContainerIO(id string, opts ...ContainerIOOpts) (_ *ContainerIO, err error) {
+func NewContainerIO(id string, opts ...ContainerIOOpts) (*ContainerIO, error) {
 	c := &ContainerIO{
 		id:          id,
 		stdoutGroup: cioutil.NewWriterGroup(),
@@ -136,7 +136,7 @@ func (c *ContainerIO) Attach(opts AttachOptions) error {
 	var wg sync.WaitGroup
 	key, err := utils.GenerateID()
 	if err != nil {
-		return errors.Wrapf(err, "container attach")
+		return errors.Wrap(err, "container attach")
 	}
 	stdinKey := streamKey(c.id, "attach-"+key, Stdin)
 	stdoutKey := streamKey(c.id, "attach-"+key, Stdout)

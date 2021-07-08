@@ -4,10 +4,10 @@ import (
 	"context"
 
 	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/server/cri/types"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // The actual test suite
@@ -32,7 +32,7 @@ var _ = t.Describe("ListPodSandbox", func() {
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{})
+				&types.ListPodSandboxRequest{})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -47,12 +47,13 @@ var _ = t.Describe("ListPodSandbox", func() {
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{})
+				&types.ListPodSandboxRequest{})
 
 			// Then
 			Expect(err).To(BeNil())
 			Expect(response).NotTo(BeNil())
-			Expect(len(response.Items)).To(BeZero())
+			// the sandbox is created, and even though it has no infra container, it should be displayed
+			Expect(len(response.Items)).To(Equal(1))
 		})
 
 		It("should skip not created sandboxes", func() {
@@ -62,7 +63,7 @@ var _ = t.Describe("ListPodSandbox", func() {
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{})
+				&types.ListPodSandboxRequest{})
 
 			// Then
 			Expect(err).To(BeNil())
@@ -74,12 +75,13 @@ var _ = t.Describe("ListPodSandbox", func() {
 			// Given
 			mockDirs(testManifest)
 			createDummyState()
-			Expect(sut.LoadSandbox(sandboxID)).To(BeNil())
+			_, err := sut.LoadSandbox(context.Background(), sandboxID)
+			Expect(err).To(BeNil())
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{Filter: &pb.PodSandboxFilter{
-					Id: sandboxID,
+				&types.ListPodSandboxRequest{Filter: &types.PodSandboxFilter{
+					ID: sandboxID,
 				}})
 
 			// Then
@@ -92,14 +94,16 @@ var _ = t.Describe("ListPodSandbox", func() {
 			// Given
 			mockDirs(testManifest)
 			createDummyState()
-			Expect(sut.LoadSandbox(sandboxID)).To(BeNil())
+			_, err := sut.LoadSandbox(context.Background(), sandboxID)
+			Expect(err).To(BeNil())
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{Filter: &pb.PodSandboxFilter{
-					Id: sandboxID,
-					State: &pb.PodSandboxStateValue{
-						State: pb.PodSandboxState_SANDBOX_READY},
+				&types.ListPodSandboxRequest{Filter: &types.PodSandboxFilter{
+					ID: sandboxID,
+					State: &types.PodSandboxStateValue{
+						State: types.PodSandboxStateSandboxReady,
+					},
 				}})
 
 			// Then
@@ -112,12 +116,13 @@ var _ = t.Describe("ListPodSandbox", func() {
 			// Given
 			mockDirs(testManifest)
 			createDummyState()
-			Expect(sut.LoadSandbox(sandboxID)).To(BeNil())
+			_, err := sut.LoadSandbox(context.Background(), sandboxID)
+			Expect(err).To(BeNil())
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{Filter: &pb.PodSandboxFilter{
-					Id:            sandboxID,
+				&types.ListPodSandboxRequest{Filter: &types.PodSandboxFilter{
+					ID:            sandboxID,
 					LabelSelector: map[string]string{"label": "value"},
 				}})
 
@@ -133,8 +138,8 @@ var _ = t.Describe("ListPodSandbox", func() {
 
 			// When
 			response, err := sut.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{Filter: &pb.PodSandboxFilter{
-					Id: sandboxID,
+				&types.ListPodSandboxRequest{Filter: &types.PodSandboxFilter{
+					ID: sandboxID,
 				}})
 
 			// Then

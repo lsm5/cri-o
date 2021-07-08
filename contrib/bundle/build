@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ARCH_AMD64=amd64
+ARCH_ARM64=arm64
+
+ARCH=${1:-$ARCH_AMD64}
+
+# Global vars to be used
+# shellcheck source=vars
+source "$(dirname "${BASH_SOURCE[0]}")"/vars "$ARCH"
+
+cd "$(dirname "$0")"
+
+# Versions to be used
+# shellcheck source=../../scripts/versions
+source "$GIT_ROOT/scripts/versions"
+
+FILES_BIN=(
+    "$GIT_ROOT/bin/static-$ARCH/crio-status"
+    "$GIT_ROOT/bin/static-$ARCH/crio"
+    "$GIT_ROOT/bin/static-$ARCH/pinns"
+)
+FILES_MAN=(
+    "$GIT_ROOT/docs/crio-status.8"
+    "$GIT_ROOT/docs/crio.8"
+    "$GIT_ROOT/docs/crio.conf.5"
+    "$GIT_ROOT/docs/crio.conf.d.5"
+)
+FILES_ETC=(
+    "$GIT_ROOT/crictl.yaml"
+    "$GIT_ROOT/crio-umount.conf"
+    "$GIT_ROOT/crio.conf"
+    "$GIT_ROOT/contrib/bundle/10-crun.conf"
+)
+FILES_CONTRIB=(
+    "$GIT_ROOT/contrib/cni/10-crio-bridge.conf"
+    "$GIT_ROOT/contrib/policy.json"
+    "$GIT_ROOT/contrib/systemd/crio.service"
+)
+COMPLETIONS="$GIT_ROOT/completions"
+
+TMPDIR="$ARCHIVE_PATH/tmp"
+rm -rf "$TMPDIR"
+mkdir -p "$TMPDIR"/{bin,contrib,etc,man}
+
+cp -r "$COMPLETIONS" "$TMPDIR"
+
+ERRORED=0
+for FILE in "${FILES_BIN[@]}"; do
+    if [[ ! -f "$FILE" ]]; then
+        echo "File '$FILE' does not exist"
+        ERRORED=1
+    elif [[ ! -x "$FILE" ]]; then
+        echo "File '$FILE' is not exectuable"
+        ERRORED=1
+    elif ! file "$FILE" | grep "statically linked" | grep -q stripped; then
+        echo "Binary '$FILE' is not statically linked and stripped"
+        ERRORED=1
+    else
+        cp "$FILE" "$TMPDIR/bin"
+    fi
+done
+
+for FILE in "${FILES_MAN[@]}"; do
+    if [[ ! -f "$FILE" ]]; then
+        echo "File '$FILE' does not exist"
+        ERRORED=1
+    else
+        cp "$FILE" "$TMPDIR/man"
+    fi
+done
+
+for FILE in "${FILES_ETC[@]}"; do
+    if [[ ! -f "$FILE" ]]; then
+        echo "File '$FILE' does not exist"
+        ERRORED=1
+    else
+        cp "$FILE" "$TMPDIR/etc"
+    fi
+done
+for FILE in "${FILES_CONTRIB[@]}"; do
+    if [[ ! -f "$FILE" ]]; then
+        echo "File '$FILE' does not exist"
+        ERRORED=1
+    else
+        cp "$FILE" "$TMPDIR/contrib"
+    fi
+done
+
+if [[ $ERRORED == 1 ]]; then
+    exit 1
+fi
+
+# Local assets
+echo "#/usr/bin/env sh" >"$TMPDIR/install"
+cat "$GIT_ROOT/contrib/bundle/install-paths" \
+    "$GIT_ROOT/contrib/bundle/install" >>"$TMPDIR/install"
+sed -i "s/-amd64/-$ARCH/" "$TMPDIR/install"
+chmod +x "$TMPDIR/install"
+
+cp "$GIT_ROOT/contrib/bundle/Makefile" "$TMPDIR"
+cp "$GIT_ROOT/contrib/bundle/README.md" "$TMPDIR"
+
+curl_to() {
+    curl -sSfL -o "$1" "$2"
+}
+TMP_BIN=$TMPDIR/bin
+
+# conmon
+curl_to "$TMP_BIN/conmon" \
+    "https://github.com/containers/conmon/releases/download/${VERSIONS["conmon"]}/conmon.$ARCH"
+chmod +x "$TMP_BIN/conmon"
+
+if [[ $ARCH == "$ARCH_AMD64" ]]; then
+    # runc
+    curl_to "$TMP_BIN/runc" \
+        "https://github.com/opencontainers/runc/releases/download/${VERSIONS["runc"]}/runc.amd64"
+    chmod +x "$TMP_BIN/runc"
+fi
+
+# crun
+curl_to "$TMP_BIN/crun" \
+    "https://github.com/containers/crun/releases/download/${VERSIONS["crun"]}/crun-${VERSIONS["crun"]}-linux-$ARCH"
+chmod +x "$TMP_BIN/crun"
+
+# CNI plugins
+mkdir -p "$TMPDIR/cni-plugins"
+curl_to - \
+    "https://github.com/containernetworking/plugins/releases/download/${VERSIONS["cni-plugins"]}/cni-plugins-linux-$ARCH-${VERSIONS["cni-plugins"]}.tgz" |
+    tar xfz - -C "$TMPDIR/cni-plugins"
+
+# crictl
+curl_to - \
+    "https://github.com/kubernetes-sigs/cri-tools/releases/download/${VERSIONS["cri-tools"]}/crictl-${VERSIONS["cri-tools"]}-linux-$ARCH.tar.gz" |
+    tar xfz - -C "$TMP_BIN"
+
+# Check the architectures of the binaries
+ELF_ARCH=x86-64
+if [[ $ARCH == "$ARCH_ARM64" ]]; then
+    ELF_ARCH=aarch64
+fi
+for FILE in "$TMP_BIN"/*; do
+    if ! file "$FILE" | grep -q "$ELF_ARCH"; then
+        echo "$FILE is not of required arch $ELF_ARCH"
+        exit 1
+    fi
+done
+
+# Create the archive
+pushd "$ARCHIVE_PATH"
+rm -f "$ARCHIVE"
+TAR_DIR=cri-o
+tar cfz "$ARCHIVE" tmp --transform s/tmp/$TAR_DIR/
+rm -rf "$TMPDIR"
+echo "Created $ARCHIVE_PATH/$ARCHIVE"
+
+# Test the archive
+echo "Testing archive"
+tar xf "$ARCHIVE"
+pushd $TAR_DIR
+export DESTDIR=test/
+./install
+EXP_CNT=65
+if [[ $ARCH == "$ARCH_AMD64" ]]; then
+    EXP_CNT=66
+fi
+ACT_CNT=$(find test | wc -l)
+if [[ "$EXP_CNT" != "$ACT_CNT" ]]; then
+    echo "install file count does not match, expected: $EXP_CNT, actual: $ACT_CNT"
+    exit 1
+fi
+popd
+rm -rf $TAR_DIR

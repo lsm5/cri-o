@@ -76,15 +76,15 @@ the `buildah run` command will not complete and an error will be raised.
 
 #### Solution
 There are two solutions to this problem.  The
-[`podman run`](https://github.com/containers/libpod/blob/master/docs/podman-run.1.md)
+[`podman run`](https://github.com/containers/podman/blob/master/docs/podman-run.1.md)
 command can be used in place of `buildah run`.  To still use `buildah run`, surround
 the command with single quotes and use `bash -c`.  The previous examples would be
 changed to:
 
 ```console
-# buildah run bash -c '$whalecontainer /usr/games/fortune -a | cowsay'
-# buildah run bash -c '$newcontainer echo "daemon off;" >> /etc/nginx/nginx.conf'
-# buildah run bash -c '$newcontainer echo "nginx on Fedora" > /usr/share/nginx/html/index.html'
+# buildah run $whalecontainer bash -c '/usr/games/fortune -a | cowsay'
+# buildah run $newcontainer bash -c 'echo "daemon off;" >> /etc/nginx/nginx.conf'
+# buildah run $newcontainer bash -c 'echo "nginx on Fedora" > /usr/share/nginx/html/index.html'
 ```
 
 ---
@@ -154,5 +154,5 @@ Choose one of the following:
   * Complete the build operation as a privileged user.
   * Install and configure fuse-overlayfs.
     * Install the fuse-overlayfs package for your Linux Distribution.
-    * Add `mount_program = "/usr/bin/fuse-overlayfs` under `[storage.options]` in your `~/.config/containers/storage.conf` file.
+    * Add `mount_program = "/usr/bin/fuse-overlayfs"` under `[storage.options]` in your `~/.config/containers/storage.conf` file.
 ---

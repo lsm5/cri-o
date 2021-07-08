@@ -3,7 +3,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,179 +12,52 @@ import (
 	"time"
 
 	"github.com/containers/buildah/pkg/secrets"
-	"github.com/containers/libpod/pkg/annotations"
-	"github.com/containers/libpod/pkg/apparmor"
-	"github.com/containers/libpod/pkg/rootless"
-	createconfig "github.com/containers/libpod/pkg/spec"
-	libconfig "github.com/cri-o/cri-o/internal/lib/config"
+	"github.com/containers/buildah/util"
+	"github.com/containers/podman/v3/pkg/rootless"
+	selinux "github.com/containers/podman/v3/pkg/selinux"
+	cstorage "github.com/containers/storage"
+	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/mount"
+	"github.com/cri-o/cri-o/internal/config/cgmgr"
+	"github.com/cri-o/cri-o/internal/config/device"
+	"github.com/cri-o/cri-o/internal/config/node"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/pkg/log"
-	"github.com/cri-o/cri-o/internal/pkg/storage"
-	"github.com/cri-o/cri-o/utils"
-	dockermounts "github.com/docker/docker/pkg/mount"
-	"github.com/docker/docker/pkg/symlink"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/devices"
+	"github.com/cri-o/cri-o/internal/log"
+	oci "github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/internal/storage"
+	crioann "github.com/cri-o/cri-o/pkg/annotations"
+	ctrIface "github.com/cri-o/cri-o/pkg/container"
+	"github.com/cri-o/cri-o/server/cri/types"
+	securejoin "github.com/cyphar/filepath-securejoin"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
-// minMemoryLimit is the minimum memory that must be set for a container.
-// A lower value would result in the container failing to start.
-const minMemoryLimit = 12582912
-
-type configDevice struct {
-	Device   rspec.LinuxDevice
-	Resource rspec.LinuxDeviceCgroup
-}
-
-func findCgroupMountpoint(name string) error {
-	// Set up pids limit if pids cgroup is mounted
-	_, err := cgroups.FindCgroupMountpoint("", name)
-	return err
-}
-
-func addDevicesPlatform(ctx context.Context, sb *sandbox.Sandbox, containerConfig *pb.ContainerConfig, specgen *generate.Generator) error {
-	sp := specgen.Config
-	if containerConfig.GetLinux().GetSecurityContext().GetPrivileged() {
-		hostDevices, err := devices.HostDevices()
-		if err != nil {
-			return err
-		}
-		for _, hostDevice := range hostDevices {
-			rd := rspec.LinuxDevice{
-				Path:  hostDevice.Path,
-				Type:  string(hostDevice.Type),
-				Major: hostDevice.Major,
-				Minor: hostDevice.Minor,
-				UID:   &hostDevice.Uid,
-				GID:   &hostDevice.Gid,
-			}
-			if hostDevice.Major == 0 && hostDevice.Minor == 0 {
-				// Invalid device, most likely a symbolic link, skip it.
-				continue
-			}
-			specgen.AddDevice(rd)
-		}
-		sp.Linux.Resources.Devices = []rspec.LinuxDeviceCgroup{
-			{
-				Allow:  true,
-				Access: "rwm",
-			},
-		}
-	}
-
-	for _, device := range containerConfig.GetDevices() {
-		// pin the device to avoid using `device` within the range scope as
-		// wrong function literal
-		device := device
-
-		// If we are privileged, we have access to devices on the host.
-		// If the requested container path already exists on the host, the container won't see the expected host path.
-		// Therefore, we must error out if the container path already exists
-		privileged := containerConfig.GetLinux().GetSecurityContext() != nil && containerConfig.GetLinux().GetSecurityContext().GetPrivileged()
-		if privileged && device.ContainerPath != device.HostPath {
-			// we expect this to not exist
-			_, err := os.Stat(device.ContainerPath)
-			if err == nil {
-				return errors.Errorf("privileged container was configured with a device container path that already exists on the host.")
-			}
-			if !os.IsNotExist(err) {
-				return errors.Wrapf(err, "error checking if container path exists on host")
-			}
-		}
-
-		path, err := resolveSymbolicLink(device.HostPath, "/")
-		if err != nil {
-			return err
-		}
-		dev, err := devices.DeviceFromPath(path, device.Permissions)
-		// if there was no error, return the device
-		if err == nil {
-			rd := rspec.LinuxDevice{
-				Path:  device.ContainerPath,
-				Type:  string(dev.Type),
-				Major: dev.Major,
-				Minor: dev.Minor,
-				UID:   &dev.Uid,
-				GID:   &dev.Gid,
-			}
-			specgen.AddDevice(rd)
-			sp.Linux.Resources.Devices = append(sp.Linux.Resources.Devices, rspec.LinuxDeviceCgroup{
-				Allow:  true,
-				Type:   string(dev.Type),
-				Major:  &dev.Major,
-				Minor:  &dev.Minor,
-				Access: dev.Permissions,
-			})
-			continue
-		}
-		// if the device is not a device node
-		// try to see if it's a directory holding many devices
-		if err == devices.ErrNotADevice {
-			// check if it is a directory
-			if e := utils.IsDirectory(path); e == nil {
-				// mount the internal devices recursively
-				// nolint: errcheck
-				filepath.Walk(path, func(dpath string, f os.FileInfo, e error) error {
-					if e != nil {
-						log.Debugf(ctx, "addDevice walk: %v", e)
-					}
-					childDevice, e := devices.DeviceFromPath(dpath, device.Permissions)
-					if e != nil {
-						// ignore the device
-						return nil
-					}
-					cPath := strings.Replace(dpath, path, device.ContainerPath, 1)
-					rd := rspec.LinuxDevice{
-						Path:  cPath,
-						Type:  string(childDevice.Type),
-						Major: childDevice.Major,
-						Minor: childDevice.Minor,
-						UID:   &childDevice.Uid,
-						GID:   &childDevice.Gid,
-					}
-					specgen.AddDevice(rd)
-					sp.Linux.Resources.Devices = append(sp.Linux.Resources.Devices, rspec.LinuxDeviceCgroup{
-						Allow:  true,
-						Type:   string(childDevice.Type),
-						Major:  &childDevice.Major,
-						Minor:  &childDevice.Minor,
-						Access: childDevice.Permissions,
-					})
-
-					return nil
-				})
-			}
-		}
-	}
-	return nil
-}
-
 // createContainerPlatform performs platform dependent intermediate steps before calling the container's oci.Runtime().CreateContainer()
-func (s *Server) createContainerPlatform(container, infraContainer *oci.Container, cgroupParent string) error {
-	if s.defaultIDMappings != nil && !s.defaultIDMappings.Empty() {
-		rootPair := s.defaultIDMappings.RootPair()
-
+func (s *Server) createContainerPlatform(ctx context.Context, container *oci.Container, cgroupParent string, idMappings *idtools.IDMappings) error {
+	if idMappings != nil && !container.Spoofed() {
+		rootPair := idMappings.RootPair()
 		for _, path := range []string{container.BundlePath(), container.MountPoint()} {
-			if err := os.Chown(path, rootPair.UID, rootPair.GID); err != nil {
-				return errors.Wrapf(err, "cannot chown %s to %d:%d", path, rootPair.UID, rootPair.GID)
-			}
-			if err := makeAccessible(path, rootPair.UID, rootPair.GID); err != nil {
+			if err := makeAccessible(path, rootPair.UID, rootPair.GID, false); err != nil {
 				return errors.Wrapf(err, "cannot make %s accessible to %d:%d", path, rootPair.UID, rootPair.GID)
 			}
 		}
+		if err := makeMountsAccessible(rootPair.UID, rootPair.GID, container.Spec().Mounts); err != nil {
+			return err
+		}
 	}
-	return s.Runtime().CreateContainer(container, cgroupParent)
+	return s.Runtime().CreateContainer(ctx, container, cgroupParent)
 }
 
 // makeAccessible changes the path permission and each parent directory to have --x--x--x
-func makeAccessible(path string, uid, gid int) error {
+func makeAccessible(path string, uid, gid int, doChown bool) error {
+	if doChown {
+		if err := os.Chown(path, uid, gid); err != nil {
+			return errors.Wrapf(err, "cannot chown %s to %d:%d", path, uid, gid)
+		}
+	}
 	for ; path != "/"; path = filepath.Dir(path) {
 		st, err := os.Stat(path)
 		if err != nil {
@@ -197,8 +69,8 @@ func makeAccessible(path string, uid, gid int) error {
 		if int(st.Sys().(*syscall.Stat_t).Uid) == uid && int(st.Sys().(*syscall.Stat_t).Gid) == gid {
 			continue
 		}
-		if st.Mode()&0111 != 0111 {
-			if err := os.Chmod(path, st.Mode()|0111); err != nil {
+		if st.Mode()&0o111 != 0o111 {
+			if err := os.Chmod(path, st.Mode()|0o111); err != nil {
 				return err
 			}
 		}
@@ -206,47 +78,78 @@ func makeAccessible(path string, uid, gid int) error {
 	return nil
 }
 
-// nolint:gocyclo
-func (s *Server) createSandboxContainer(ctx context.Context, containerID, containerName string, sb *sandbox.Sandbox, sandboxConfig *pb.PodSandboxConfig, containerConfig *pb.ContainerConfig) (*oci.Container, error) {
-	if sb == nil {
-		return nil, errors.New("createSandboxContainer needs a sandbox")
+// makeMountsAccessible makes sure all the mounts are accessible from the user namespace
+func makeMountsAccessible(uid, gid int, mounts []rspec.Mount) error {
+	for _, m := range mounts {
+		if m.Type == "bind" || util.StringInSlice("bind", m.Options) {
+			if err := makeAccessible(m.Source, uid, gid, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func toContainer(id uint32, idMap []idtools.IDMap) uint32 {
+	hostID := int(id)
+	if idMap == nil {
+		return uint32(hostID)
+	}
+	for _, m := range idMap {
+		if hostID >= m.HostID && hostID < m.HostID+m.Size {
+			contID := m.ContainerID + (hostID - m.HostID)
+			return uint32(contID)
+		}
+	}
+	// If the ID cannot be mapped, it means the RunAsUser or RunAsGroup was not specified
+	// so just use the original value.
+	return id
+}
+
+// finalizeUserMapping changes the UID, GID and additional GIDs to reflect the new value in the user namespace.
+func (s *Server) finalizeUserMapping(specgen *generate.Generator, mappings *idtools.IDMappings) {
+	if mappings == nil {
+		return
 	}
 
+	// if the namespace was configured because of a static configuration, do not attempt any mapping
+	if s.defaultIDMappings != nil && !s.defaultIDMappings.Empty() {
+		return
+	}
+
+	specgen.Config.Process.User.UID = toContainer(specgen.Config.Process.User.UID, mappings.UIDs())
+	gids := mappings.GIDs()
+	specgen.Config.Process.User.GID = toContainer(specgen.Config.Process.User.GID, gids)
+	for i := range specgen.Config.Process.User.AdditionalGids {
+		gid := toContainer(specgen.Config.Process.User.AdditionalGids[i], gids)
+		specgen.Config.Process.User.AdditionalGids[i] = gid
+	}
+}
+
+func (s *Server) createSandboxContainer(ctx context.Context, ctr ctrIface.Container, sb *sandbox.Sandbox) (cntr *oci.Container, retErr error) {
 	// TODO: simplify this function (cyclomatic complexity here is high)
 	// TODO: factor generating/updating the spec into something other projects can vendor
 
-	// creates a spec Generator with the default spec.
-	specgen, err := generate.New("linux")
-	if err != nil {
+	// eventually, we'd like to access all of these variables through the interface themselves, and do most
+	// of the translation between CRI config -> oci/storage container in the container package
+	containerID := ctr.ID()
+	containerName := ctr.Name()
+	containerConfig := ctr.Config()
+	if err := ctr.SetPrivileged(); err != nil {
 		return nil, err
 	}
+	securityContext := containerConfig.Linux.SecurityContext
+
+	// creates a spec Generator with the default spec.
+	specgen := ctr.Spec()
 	specgen.HostSpecific = true
 	specgen.ClearProcessRlimits()
 
-	ulimits, err := getUlimitsFromConfig(&s.config)
-	if err != nil {
-		return nil, err
-	}
-	for _, u := range ulimits {
-		specgen.AddProcessRlimits(u.name, u.hard, u.soft)
+	for _, u := range s.config.Ulimits() {
+		specgen.AddProcessRlimits(u.Name, u.Hard, u.Soft)
 	}
 
-	readOnlyRootfs := s.config.ReadOnly
-
-	var privileged bool
-	if containerConfig.GetLinux().GetSecurityContext() != nil {
-		if containerConfig.GetLinux().GetSecurityContext().GetPrivileged() {
-			privileged = true
-		}
-		if privileged {
-			if !sandboxConfig.GetLinux().GetSecurityContext().GetPrivileged() {
-				return nil, errors.New("no privileged container allowed in sandbox")
-			}
-		}
-		if containerConfig.GetLinux().GetSecurityContext().GetReadonlyRootfs() {
-			readOnlyRootfs = true
-		}
-	}
+	readOnlyRootfs := ctr.ReadOnly(s.config.ReadOnly)
 	specgen.SetRootReadonly(readOnlyRootfs)
 
 	if s.config.ReadOnly {
@@ -254,48 +157,28 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 		// WORK ON: Use "overlay" mounts as an alternative to tmpfs with tmpcopyup
 		// Look at https://github.com/cri-o/cri-o/pull/1434#discussion_r177200245 for more info on this
 		options := []string{"rw", "noexec", "nosuid", "nodev", "tmpcopyup"}
-		if !isInCRIMounts("/run", containerConfig.GetMounts()) {
-			mnt := rspec.Mount{
-				Destination: "/run",
-				Type:        "tmpfs",
-				Source:      "tmpfs",
-				Options:     append(options, "mode=0755"),
-			}
-			// Add tmpfs mount on /run
-			specgen.AddMount(mnt)
+		mounts := map[string]string{
+			"/run":     "mode=0755",
+			"/tmp":     "mode=1777",
+			"/var/tmp": "mode=1777",
 		}
-		if !isInCRIMounts("/tmp", containerConfig.GetMounts()) {
-			mnt := rspec.Mount{
-				Destination: "/tmp",
-				Type:        "tmpfs",
-				Source:      "tmpfs",
-				Options:     append(options, "mode=1777"),
+		for target, mode := range mounts {
+			if !isInCRIMounts(target, containerConfig.Mounts) {
+				ctr.SpecAddMount(rspec.Mount{
+					Destination: target,
+					Type:        "tmpfs",
+					Source:      "tmpfs",
+					Options:     append(options, mode),
+				})
 			}
-			// Add tmpfs mount on /tmp
-			specgen.AddMount(mnt)
-		}
-		if !isInCRIMounts("/var/tmp", containerConfig.GetMounts()) {
-			mnt := rspec.Mount{
-				Destination: "/var/tmp",
-				Type:        "tmpfs",
-				Source:      "tmpfs",
-				Options:     append(options, "mode=1777"),
-			}
-			// Add tmpfs mount on /var/tmp
-			specgen.AddMount(mnt)
 		}
 	}
 
-	imageSpec := containerConfig.GetImage()
-	if imageSpec == nil {
-		return nil, fmt.Errorf("CreateContainerRequest.ContainerConfig.Image is nil")
+	image, err := ctr.Image()
+	if err != nil {
+		return nil, err
 	}
-
-	image := imageSpec.Image
-	if image == "" {
-		return nil, fmt.Errorf("CreateContainerRequest.ContainerConfig.Image.Image is empty")
-	}
-	images, err := s.StorageImageServer().ResolveNames(s.systemContext, image)
+	images, err := s.StorageImageServer().ResolveNames(s.config.SystemContext, image)
 	if err != nil {
 		if err == storage.ErrCannotParseImageID {
 			images = append(images, image)
@@ -310,7 +193,7 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 		imgResultErr error
 	)
 	for _, img := range images {
-		imgResult, imgResultErr = s.StorageImageServer().ImageStatus(s.systemContext, img)
+		imgResult, imgResultErr = s.StorageImageServer().ImageStatus(s.config.SystemContext, img)
 		if imgResultErr == nil {
 			break
 		}
@@ -325,43 +208,53 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 		imageRef = imgResult.RepoDigests[0]
 	}
 
-	specgen.AddAnnotation(annotations.Image, image)
-	specgen.AddAnnotation(annotations.ImageName, imageName)
-	specgen.AddAnnotation(annotations.ImageRef, imageRef)
-
-	selinuxConfig := containerConfig.GetLinux().GetSecurityContext().GetSelinuxOptions()
-	var labelOptions []string
-	if selinuxConfig == nil {
-		labelOptions, err = label.DupSecOpt(sb.ProcessLabel())
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		labelOptions = getLabelOptions(selinuxConfig)
+	labelOptions, err := ctr.SelinuxLabel(sb.ProcessLabel())
+	if err != nil {
+		return nil, err
 	}
 
-	containerIDMappings := s.defaultIDMappings
-	metadata := containerConfig.GetMetadata()
+	containerIDMappings, err := s.getSandboxIDMappings(sb)
+	if err != nil {
+		return nil, err
+	}
 
-	containerInfo, err := s.StorageRuntimeServer().CreateContainer(s.systemContext,
+	var idMappingOptions *cstorage.IDMappingOptions
+	if containerIDMappings != nil {
+		idMappingOptions = &cstorage.IDMappingOptions{UIDMap: containerIDMappings.UIDs(), GIDMap: containerIDMappings.GIDs()}
+	}
+
+	metadata := containerConfig.Metadata
+
+	containerInfo, err := s.StorageRuntimeServer().CreateContainer(s.config.SystemContext,
 		sb.Name(), sb.ID(),
 		image, imgResult.ID,
 		containerName, containerID,
 		metadata.Name,
 		metadata.Attempt,
-		containerIDMappings,
-		labelOptions)
+		idMappingOptions,
+		labelOptions,
+		ctr.Privileged(),
+	)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "CreateCtrLinux: deleting container %s from storage", containerInfo.ID)
+			if err := s.StorageRuntimeServer().DeleteContainer(containerInfo.ID); err != nil {
+				log.Warnf(ctx, "Failed to cleanup container directory: %v", err)
+			}
+		}
+	}()
+
 	mountLabel := containerInfo.MountLabel
 	var processLabel string
-	if !privileged {
+	if !ctr.Privileged() {
 		processLabel = containerInfo.ProcessLabel
 	}
-	hostIPC := containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetIpc() == pb.NamespaceMode_NODE
-	hostPID := containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetPid() == pb.NamespaceMode_NODE
-	hostNet := containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == pb.NamespaceMode_NODE
+	hostIPC := securityContext.NamespaceOptions.Ipc == types.NamespaceModeNODE
+	hostPID := securityContext.NamespaceOptions.Pid == types.NamespaceModeNODE
+	hostNet := securityContext.NamespaceOptions.Network == types.NamespaceModeNODE
 
 	// Don't use SELinux separation with Host Pid or IPC Namespace or privileged.
 	if hostPID || hostIPC {
@@ -372,166 +265,109 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 		processLabel = ""
 	}
 
-	defer func() {
-		if err != nil {
-			err2 := s.StorageRuntimeServer().DeleteContainer(containerInfo.ID)
-			if err2 != nil {
-				log.Warnf(ctx, "Failed to cleanup container directory: %v", err2)
-			}
-		}
-	}()
-	specgen.SetLinuxMountLabel(mountLabel)
-	specgen.SetProcessSelinuxLabel(processLabel)
-
-	containerVolumes, ociMounts, err := addOCIBindMounts(ctx, mountLabel, containerConfig, &specgen, s.config.RuntimeConfig.BindMountPrefix)
+	containerVolumes, ociMounts, err := addOCIBindMounts(ctx, mountLabel, containerConfig, specgen, s.config.RuntimeConfig.BindMountPrefix, s.config.AbsentMountSourcesToReject)
 	if err != nil {
 		return nil, err
 	}
 
-	volumesJSON, err := json.Marshal(containerVolumes)
-	if err != nil {
-		return nil, err
-	}
-	specgen.AddAnnotation(annotations.Volumes, string(volumesJSON))
+	configuredDevices := s.config.Devices()
 
-	configuredDevices, err := getDevicesFromConfig(ctx, &s.config)
+	privilegedWithoutHostDevices, err := s.Runtime().PrivilegedWithoutHostDevices(sb.RuntimeHandler())
 	if err != nil {
 		return nil, err
 	}
 
-	for i := range configuredDevices {
-		d := &configuredDevices[i]
-
-		specgen.AddDevice(d.Device)
-		specgen.AddLinuxResourcesDevice(d.Resource.Allow, d.Resource.Type, d.Resource.Major, d.Resource.Minor, d.Resource.Access)
-	}
-
-	if err := addDevices(ctx, sb, containerConfig, &specgen); err != nil {
+	annotationDevices, err := device.DevicesFromAnnotation(sb.Annotations()[crioann.DevicesAnnotation])
+	if err != nil {
 		return nil, err
 	}
 
-	labels := containerConfig.GetLabels()
+	if err := ctr.SpecAddDevices(configuredDevices, annotationDevices, privilegedWithoutHostDevices); err != nil {
+		return nil, err
+	}
+
+	labels := containerConfig.Labels
 
 	if err := validateLabels(labels); err != nil {
 		return nil, err
 	}
 
-	kubeAnnotations := containerConfig.GetAnnotations()
-	for k, v := range kubeAnnotations {
-		specgen.AddAnnotation(k, v)
-	}
-	for k, v := range labels {
-		specgen.AddAnnotation(k, v)
-	}
-
 	// set this container's apparmor profile if it is set by sandbox
-	if s.appArmorEnabled && !privileged {
-		appArmorProfileName := s.getAppArmorProfileName(containerConfig.GetLinux().GetSecurityContext().GetApparmorProfile())
-		if appArmorProfileName != "" {
-			// reload default apparmor profile if it is unloaded.
-			if s.appArmorProfile == libconfig.DefaultApparmorProfile {
-				isLoaded, err := apparmor.IsLoaded(libconfig.DefaultApparmorProfile)
-				if err != nil {
-					return nil, err
-				}
-				if !isLoaded {
-					if err := apparmor.InstallDefault(libconfig.DefaultApparmorProfile); err != nil {
-						return nil, err
-					}
-				}
-			}
-
-			specgen.SetProcessApparmorProfile(appArmorProfileName)
+	if s.Config().AppArmor().IsEnabled() && !ctr.Privileged() {
+		profile, err := s.Config().AppArmor().Apply(
+			securityContext.ApparmorProfile,
+		)
+		if err != nil {
+			return nil, errors.Wrapf(err, "applying apparmor profile to container %s", containerID)
 		}
+
+		log.Debugf(ctx, "Applied AppArmor profile %s to container %s", profile, containerID)
+		specgen.SetProcessApparmorProfile(profile)
 	}
 
-	logPath := containerConfig.GetLogPath()
-	sboxLogDir := sandboxConfig.GetLogDirectory()
-	if sboxLogDir == "" {
-		sboxLogDir = sb.LogDir()
-	}
-	if logPath == "" {
-		logPath = filepath.Join(sboxLogDir, containerID+".log")
-	}
-	if !filepath.IsAbs(logPath) {
-		// XXX: It's not really clear what this should be versus the sbox logDirectory.
-		log.Warnf(ctx, "requested logPath for ctr id %s is a relative path: %s", containerID, logPath)
-		logPath = filepath.Join(sboxLogDir, logPath)
-		log.Warnf(ctx, "logPath from relative path is now absolute: %s", logPath)
-	}
-
-	// Handle https://issues.k8s.io/44043
-	if err := ensureSaneLogPath(logPath); err != nil {
+	logPath, err := ctr.LogPath(sb.LogDir())
+	if err != nil {
 		return nil, err
 	}
-
-	log.Debugf(ctx, "setting container's log_path = %s, sbox.logdir = %s, ctr.logfile = %s",
-		sboxLogDir, containerConfig.GetLogPath(), logPath,
-	)
 
 	specgen.SetProcessTerminal(containerConfig.Tty)
 	if containerConfig.Tty {
 		specgen.AddProcessEnv("TERM", "xterm")
 	}
 
-	linux := containerConfig.GetLinux()
+	linux := containerConfig.Linux
 	if linux != nil {
-		resources := linux.GetResources()
+		resources := linux.Resources
 		if resources != nil {
-			specgen.SetLinuxResourcesCPUPeriod(uint64(resources.GetCpuPeriod()))
-			specgen.SetLinuxResourcesCPUQuota(resources.GetCpuQuota())
-			specgen.SetLinuxResourcesCPUShares(uint64(resources.GetCpuShares()))
+			specgen.SetLinuxResourcesCPUPeriod(uint64(resources.CPUPeriod))
+			specgen.SetLinuxResourcesCPUQuota(resources.CPUQuota)
+			specgen.SetLinuxResourcesCPUShares(uint64(resources.CPUShares))
 
-			memoryLimit := resources.GetMemoryLimitInBytes()
-			if memoryLimit != 0 && memoryLimit < minMemoryLimit {
-				return nil, fmt.Errorf("set memory limit %v too low; should be at least %v", memoryLimit, minMemoryLimit)
+			memoryLimit := resources.MemoryLimitInBytes
+			if memoryLimit != 0 {
+				if err := cgmgr.VerifyMemoryIsEnough(memoryLimit); err != nil {
+					return nil, err
+				}
+				specgen.SetLinuxResourcesMemoryLimit(memoryLimit)
+				if node.CgroupHasMemorySwap() {
+					specgen.SetLinuxResourcesMemorySwap(memoryLimit)
+				}
 			}
-			specgen.SetLinuxResourcesMemoryLimit(memoryLimit)
 
-			specgen.SetProcessOOMScoreAdj(int(resources.GetOomScoreAdj()))
-			specgen.SetLinuxResourcesCPUCpus(resources.GetCpusetCpus())
-			specgen.SetLinuxResourcesCPUMems(resources.GetCpusetMems())
+			specgen.SetProcessOOMScoreAdj(int(resources.OomScoreAdj))
+			specgen.SetLinuxResourcesCPUCpus(resources.CPUsetCPUs)
+			specgen.SetLinuxResourcesCPUMems(resources.CPUsetMems)
+
+			// If the kernel has no support for hugetlb, silently ignore the limits
+			if node.CgroupHasHugetlb() {
+				hugepageLimits := resources.HugepageLimits
+				for _, limit := range hugepageLimits {
+					specgen.AddLinuxResourcesHugepageLimit(limit.PageSize, limit.Limit)
+				}
+			}
 		}
 
-		var cgPath string
-		parent := defaultCgroupfsParent
-		useSystemd := s.config.CgroupManager == oci.SystemdCgroupsManager
-		if useSystemd {
-			parent = defaultSystemdParent
-		}
-		if sb.CgroupParent() != "" {
-			parent = sb.CgroupParent()
-		}
-		if useSystemd {
-			cgPath = parent + ":" + scopePrefix + ":" + containerID
-		} else {
-			cgPath = filepath.Join(parent, scopePrefix+"-"+containerID)
-		}
-		specgen.SetLinuxCgroupsPath(cgPath)
+		specgen.SetLinuxCgroupsPath(s.config.CgroupManager().ContainerCgroupPath(sb.CgroupParent(), containerID))
 
-		if privileged {
+		if ctr.Privileged() {
 			specgen.SetupPrivileged(true)
 		} else {
-			capabilities := linux.GetSecurityContext().GetCapabilities()
+			capabilities := securityContext.Capabilities
 			// Ensure we don't get a nil pointer error if the config
 			// doesn't set any capabilities
 			if capabilities == nil {
-				capabilities = &pb.Capability{}
+				capabilities = &types.Capability{}
 			}
 			// Clear default capabilities from spec
 			specgen.ClearProcessCapabilities()
-			capabilities.AddCapabilities = append(capabilities.AddCapabilities, s.config.DefaultCapabilities...)
-			err = setupCapabilities(&specgen, capabilities)
+			err = setupCapabilities(specgen, capabilities, s.config.DefaultCapabilities)
 			if err != nil {
 				return nil, err
 			}
 		}
-		specgen.SetProcessNoNewPrivileges(linux.GetSecurityContext().GetNoNewPrivs())
+		specgen.SetProcessNoNewPrivileges(securityContext.NoNewPrivs)
 
-		if containerConfig.GetLinux().GetSecurityContext() != nil &&
-			!containerConfig.GetLinux().GetSecurityContext().Privileged {
-			// TODO(runcom): have just one of this var at the top of the function
-			securityContext := containerConfig.GetLinux().GetSecurityContext()
+		if !ctr.Privileged() {
 			for _, mp := range []string{
 				"/proc/acpi",
 				"/proc/kcore",
@@ -542,12 +378,13 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 				"/proc/sched_debug",
 				"/proc/scsi",
 				"/sys/firmware",
+				"/sys/dev",
 			} {
 				specgen.AddLinuxMaskedPaths(mp)
 			}
-			if securityContext.GetMaskedPaths() != nil {
+			if securityContext.MaskedPaths != nil {
 				specgen.Config.Linux.MaskedPaths = nil
-				for _, path := range securityContext.GetMaskedPaths() {
+				for _, path := range securityContext.MaskedPaths {
 					specgen.AddLinuxMaskedPaths(path)
 				}
 			}
@@ -562,38 +399,35 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 			} {
 				specgen.AddLinuxReadonlyPaths(rp)
 			}
-			if securityContext.GetReadonlyPaths() != nil {
+			if securityContext.ReadonlyPaths != nil {
 				specgen.Config.Linux.ReadonlyPaths = nil
-				for _, path := range securityContext.GetReadonlyPaths() {
+				for _, path := range securityContext.ReadonlyPaths {
 					specgen.AddLinuxReadonlyPaths(path)
 				}
 			}
 		}
 	}
 
+	if err := ctr.AddUnifiedResourcesFromAnnotations(sb.Annotations()); err != nil {
+		return nil, err
+	}
+
 	// Join the namespace paths for the pod sandbox container.
-	podInfraState := sb.InfraContainer().State()
-
-	log.Debugf(ctx, "pod container state %+v", podInfraState)
-
-	ipcNsPath := fmt.Sprintf("/proc/%d/ns/ipc", podInfraState.Pid)
-	if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.IPCNamespace), ipcNsPath); err != nil {
-		return nil, err
+	if err := configureGeneratorGivenNamespacePaths(sb.NamespacePaths(), specgen); err != nil {
+		return nil, errors.Wrap(err, "failed to configure namespaces in container create")
 	}
 
-	utsNsPath := fmt.Sprintf("/proc/%d/ns/uts", podInfraState.Pid)
-	if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.UTSNamespace), utsNsPath); err != nil {
-		return nil, err
-	}
-
-	if containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetPid() == pb.NamespaceMode_NODE {
+	if securityContext.NamespaceOptions.Pid == types.NamespaceModeNODE {
 		// kubernetes PodSpec specify to use Host PID namespace
 		if err := specgen.RemoveLinuxNamespace(string(rspec.PIDNamespace)); err != nil {
 			return nil, err
 		}
-	} else if containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetPid() == pb.NamespaceMode_POD {
-		// share Pod PID namespace
-		pidNsPath := fmt.Sprintf("/proc/%d/ns/pid", podInfraState.Pid)
+	} else if securityContext.NamespaceOptions.Pid == types.NamespaceModePOD {
+		pidNsPath := sb.PidNsPath()
+		if pidNsPath == "" {
+			return nil, errors.New("PID namespace requested, but sandbox infra container invalid")
+		}
+
 		if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.PIDNamespace), pidNsPath); err != nil {
 			return nil, err
 		}
@@ -605,57 +439,63 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 			return nil, err
 		}
 
-		if !isInCRIMounts("/sys", containerConfig.GetMounts()) {
+		if !isInCRIMounts("/sys", containerConfig.Mounts) {
 			specgen.RemoveMount("/sys")
-			specgen.RemoveMount("/sys/fs/cgroup")
-			sysMnt := rspec.Mount{
+			ctr.SpecAddMount(rspec.Mount{
 				Destination: "/sys",
-				Type:        "bind",
-				Source:      "/sys",
-				Options:     []string{"nosuid", "noexec", "nodev", "ro", "rbind"},
-			}
-			specgen.AddMount(sysMnt)
+				Type:        "sysfs",
+				Source:      "sysfs",
+				Options:     []string{"nosuid", "noexec", "nodev", "ro"},
+			})
 		}
-	} else {
-		netNsPath := sb.NetNsPath()
-		if netNsPath == "" {
-			// The sandbox does not have a permanent namespace,
-			// it's on the host one.
-			netNsPath = fmt.Sprintf("/proc/%d/ns/net", podInfraState.Pid)
-		}
+	}
 
-		if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.NetworkNamespace), netNsPath); err != nil {
+	if ctr.Privileged() {
+		ctr.SpecAddMount(rspec.Mount{
+			Destination: "/sys",
+			Type:        "sysfs",
+			Source:      "sysfs",
+			Options:     []string{"nosuid", "noexec", "nodev", "rw", "rslave"},
+		})
+		ctr.SpecAddMount(rspec.Mount{
+			Destination: "/sys/fs/cgroup",
+			Type:        "cgroup",
+			Source:      "cgroup",
+			Options:     []string{"nosuid", "noexec", "nodev", "rw", "relatime", "rslave"},
+		})
+	}
+
+	containerImageConfig := containerInfo.Config
+	if containerImageConfig == nil {
+		err = fmt.Errorf("empty image config for %s", image)
+		return nil, err
+	}
+
+	if err := ctr.SpecSetProcessArgs(containerImageConfig); err != nil {
+		return nil, err
+	}
+
+	if ctr.WillRunSystemd() {
+		processLabel, err = selinux.InitLabel(processLabel)
+		if err != nil {
 			return nil, err
 		}
+		setupSystemd(specgen.Mounts(), *specgen)
+	}
 
-		if privileged {
-			specgen.RemoveMount("/sys")
-			specgen.RemoveMount("/sys/fs/cgroup")
-			sysMnt := rspec.Mount{
-				Destination: "/sys",
-				Type:        "bind",
-				Source:      "/sys",
-				Options:     []string{"nosuid", "noexec", "nodev", "rw", "rbind"},
-			}
-			specgen.AddMount(sysMnt)
+	// When running on cgroupv2, automatically add a cgroup namespace for not privileged containers.
+	if !ctr.Privileged() && node.CgroupIsV2() {
+		if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.CgroupNamespace), ""); err != nil {
+			return nil, err
 		}
 	}
 
-	for idx, ip := range sb.IPs() {
-		specgen.AddAnnotation(fmt.Sprintf("%s.%d", annotations.IP, idx), ip)
-	}
-
-	// Remove the default /dev/shm mount to ensure we overwrite it
-	specgen.RemoveMount("/dev/shm")
-
-	mnt := rspec.Mount{
+	ctr.SpecAddMount(rspec.Mount{
+		Destination: "/dev/shm",
 		Type:        "bind",
 		Source:      sb.ShmPath(),
-		Destination: "/dev/shm",
 		Options:     []string{"rw", "bind"},
-	}
-	// bind mount the pod shm
-	specgen.AddMount(mnt)
+	})
 
 	options := []string{"rw"}
 	if readOnlyRootfs {
@@ -665,130 +505,107 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 		if err := securityLabel(sb.ResolvPath(), mountLabel, false); err != nil {
 			return nil, err
 		}
-
-		mnt = rspec.Mount{
+		ctr.SpecAddMount(rspec.Mount{
+			Destination: "/etc/resolv.conf",
 			Type:        "bind",
 			Source:      sb.ResolvPath(),
-			Destination: "/etc/resolv.conf",
-			Options:     []string{"bind", "nodev", "nosuid", "noexec"},
-		}
-		// bind mount the pod resolver file
-		specgen.AddMount(mnt)
+			Options:     append(options, []string{"bind", "nodev", "nosuid", "noexec"}...),
+		})
 	}
 
 	if sb.HostnamePath() != "" {
 		if err := securityLabel(sb.HostnamePath(), mountLabel, false); err != nil {
 			return nil, err
 		}
-
-		mnt = rspec.Mount{
+		ctr.SpecAddMount(rspec.Mount{
+			Destination: "/etc/hostname",
 			Type:        "bind",
 			Source:      sb.HostnamePath(),
-			Destination: "/etc/hostname",
 			Options:     append(options, "bind"),
-		}
-		specgen.AddMount(mnt)
+		})
 	}
 
-	if !isInCRIMounts("/etc/hosts", containerConfig.GetMounts()) && hostNetwork(containerConfig) {
+	if !isInCRIMounts("/etc/hosts", containerConfig.Mounts) && hostNetwork(containerConfig) {
 		// Only bind mount for host netns and when CRI does not give us any hosts file
-		mnt = rspec.Mount{
+		ctr.SpecAddMount(rspec.Mount{
+			Destination: "/etc/hosts",
 			Type:        "bind",
 			Source:      "/etc/hosts",
-			Destination: "/etc/hosts",
 			Options:     append(options, "bind"),
-		}
-		specgen.AddMount(mnt)
+		})
 	}
 
-	if privileged {
-		setOCIBindMountsPrivileged(&specgen)
+	if ctr.Privileged() {
+		setOCIBindMountsPrivileged(specgen)
 	}
 
 	// Set hostname and add env for hostname
 	specgen.SetHostname(sb.Hostname())
 	specgen.AddProcessEnv("HOSTNAME", sb.Hostname())
 
-	specgen.AddAnnotation(annotations.Name, containerName)
-	specgen.AddAnnotation(annotations.ContainerID, containerID)
-	specgen.AddAnnotation(annotations.SandboxID, sb.ID())
-	specgen.AddAnnotation(annotations.SandboxName, sb.InfraContainer().Name())
-	specgen.AddAnnotation(annotations.ContainerType, annotations.ContainerTypeContainer)
-	specgen.AddAnnotation(annotations.LogPath, logPath)
-	specgen.AddAnnotation(annotations.TTY, fmt.Sprintf("%v", containerConfig.Tty))
-	specgen.AddAnnotation(annotations.Stdin, fmt.Sprintf("%v", containerConfig.Stdin))
-	specgen.AddAnnotation(annotations.StdinOnce, fmt.Sprintf("%v", containerConfig.StdinOnce))
-	specgen.AddAnnotation(annotations.ResolvPath, sb.InfraContainer().CrioAnnotations()[annotations.ResolvPath])
-
 	created := time.Now()
-	specgen.AddAnnotation(annotations.Created, created.Format(time.RFC3339Nano))
-
-	metadataJSON, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, err
-	}
-	specgen.AddAnnotation(annotations.Metadata, string(metadataJSON))
-
-	labelsJSON, err := json.Marshal(labels)
-	if err != nil {
-		return nil, err
-	}
-	specgen.AddAnnotation(annotations.Labels, string(labelsJSON))
-
-	kubeAnnotationsJSON, err := json.Marshal(kubeAnnotations)
-	if err != nil {
-		return nil, err
-	}
-	specgen.AddAnnotation(annotations.Annotations, string(kubeAnnotationsJSON))
-
-	spp := containerConfig.GetLinux().GetSecurityContext().GetSeccompProfilePath()
-	if !privileged {
-		if err := s.setupSeccomp(ctx, &specgen, spp); err != nil {
-			return nil, err
+	if !ctr.Privileged() {
+		if err := s.Config().Seccomp().Setup(
+			ctx,
+			specgen,
+			securityContext.Seccomp,
+			containerConfig.Linux.SecurityContext.SeccompProfilePath,
+		); err != nil {
+			return nil, errors.Wrap(err, "setup seccomp")
 		}
 	}
-	specgen.AddAnnotation(annotations.SeccompProfilePath, spp)
 
 	mountPoint, err := s.StorageRuntimeServer().StartContainer(containerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount container %s(%s): %v", containerName, containerID, err)
 	}
-	specgen.AddAnnotation(annotations.MountPoint, mountPoint)
 
-	containerImageConfig := containerInfo.Config
-	if containerImageConfig == nil {
-		err = fmt.Errorf("empty image config for %s", image)
+	defer func() {
+		if retErr != nil {
+			log.Infof(ctx, "CreateCtrLinux: stopping storage container %s", containerID)
+			if err := s.StorageRuntimeServer().StopContainer(containerID); err != nil {
+				log.Warnf(ctx, "Couldn't stop storage container: %v: %v", containerID, err)
+			}
+		}
+	}()
+
+	// TODO: eventually, this should be in the container package, but it's going through a lot of churn
+	// and SpecAddAnnotations is already passed too many arguments
+	if err := s.Runtime().FilterDisallowedAnnotations(sb.RuntimeHandler(), ctr.Config().Annotations); err != nil {
 		return nil, err
 	}
 
-	if containerImageConfig.Config.StopSignal != "" {
-		// this key is defined in image-spec conversion document at https://github.com/opencontainers/image-spec/pull/492/files#diff-8aafbe2c3690162540381b8cdb157112R57
-		specgen.AddAnnotation("org.opencontainers.image.stopSignal", containerImageConfig.Config.StopSignal)
+	err = ctr.SpecAddAnnotations(ctx, sb, containerVolumes, mountPoint, containerImageConfig.Config.StopSignal, imgResult, s.config.CgroupManager().IsSystemd(), node.SystemdHasCollectMode())
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.config.Workloads.MutateSpecGivenAnnotations(ctr.Config().Metadata.Name, ctr.Spec(), sb.Annotations()); err != nil {
+		return nil, err
+	}
+
+	// First add any configured environment variables from crio config.
+	// They will get overridden if specified in the image or container config.
+	specgen.AddMultipleProcessEnv(s.Config().DefaultEnv)
+
+	// Add environment variables from image the CRI configuration
+	envs := mergeEnvs(containerImageConfig, containerConfig.Envs)
+	for _, e := range envs {
+		parts := strings.SplitN(e, "=", 2)
+		specgen.AddProcessEnv(parts[0], parts[1])
 	}
 
 	// Setup user and groups
 	if linux != nil {
-		if err := setupContainerUser(ctx, &specgen, mountPoint, mountLabel, containerInfo.RunDir, linux.GetSecurityContext(), containerImageConfig); err != nil {
+		if err := setupContainerUser(ctx, specgen, mountPoint, mountLabel, containerInfo.RunDir, securityContext, containerImageConfig); err != nil {
 			return nil, err
 		}
 	}
 
 	// Add image volumes
-	volumeMounts, err := addImageVolumes(ctx, mountPoint, s, &containerInfo, mountLabel, &specgen)
+	volumeMounts, err := addImageVolumes(ctx, mountPoint, s, &containerInfo, mountLabel, specgen)
 	if err != nil {
 		return nil, err
-	}
-
-	processArgs, err := buildOCIProcessArgs(ctx, containerConfig, containerImageConfig)
-	if err != nil {
-		return nil, err
-	}
-	specgen.SetProcessArgs(processArgs)
-
-	envs := mergeEnvs(containerImageConfig, containerConfig.GetEnvs())
-	for _, e := range envs {
-		parts := strings.SplitN(e, "=", 2)
-		specgen.AddProcessEnv(parts[0], parts[1])
 	}
 
 	// Set working directory
@@ -804,24 +621,11 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 	}
 	specgen.SetProcessCwd(containerCwd)
 	if err := setupWorkingDirectory(mountPoint, mountLabel, containerCwd); err != nil {
-		if err1 := s.StorageRuntimeServer().StopContainer(containerID); err1 != nil {
-			return nil, fmt.Errorf("can't umount container after cwd error %v: %v", err, err1)
-		}
 		return nil, err
 	}
 
-	var secretMounts []rspec.Mount
-	if len(s.config.DefaultMounts) > 0 {
-		// This option has been deprecated, once it is removed in the later versions, delete the server/secrets.go file as well
-		log.Warnf(ctx, "--default-mounts has been deprecated and will be removed in future versions. Add mounts to either %q or %q", secrets.DefaultMountsFile, secrets.OverrideMountsFile)
-		var err error
-		secretMounts, err = addSecretsBindMounts(ctx, mountLabel, containerInfo.RunDir, s.config.DefaultMounts, specgen)
-		if err != nil {
-			return nil, fmt.Errorf("failed to mount secrets: %v", err)
-		}
-	}
 	// Add secrets from the default and override mounts.conf files
-	secretMounts = append(secretMounts, secrets.SecretMounts(mountLabel, containerInfo.RunDir, s.config.DefaultMountsFile, rootless.IsRootless())...)
+	secretMounts := secrets.SecretMounts(mountLabel, containerInfo.RunDir, s.config.DefaultMountsFile, rootless.IsRootless(), ctr.DisableFips())
 
 	mounts := []rspec.Mount{}
 	mounts = append(mounts, ociMounts...)
@@ -831,30 +635,31 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 	sort.Sort(orderedMounts(mounts))
 
 	for _, m := range mounts {
-		mnt = rspec.Mount{
+		rspecMount := rspec.Mount{
 			Type:        "bind",
-			Source:      m.Source,
-			Destination: m.Destination,
 			Options:     append(m.Options, "bind"),
+			Destination: m.Destination,
+			Source:      m.Source,
 		}
-		specgen.AddMount(mnt)
+		ctr.SpecAddMount(rspecMount)
 	}
 
-	newAnnotations := map[string]string{}
-	for key, value := range containerConfig.GetAnnotations() {
-		newAnnotations[key] = value
-	}
-	for key, value := range sb.Annotations() {
-		newAnnotations[key] = value
-	}
 	if s.ContainerServer.Hooks != nil {
-		if _, err := s.ContainerServer.Hooks.Hooks(specgen.Config, newAnnotations, len(containerConfig.GetMounts()) > 0); err != nil {
+		newAnnotations := map[string]string{}
+		for key, value := range containerConfig.Annotations {
+			newAnnotations[key] = value
+		}
+		for key, value := range sb.Annotations() {
+			newAnnotations[key] = value
+		}
+
+		if _, err := s.ContainerServer.Hooks.Hooks(specgen.Config, newAnnotations, len(containerConfig.Mounts) > 0); err != nil {
 			return nil, err
 		}
 	}
 
 	// Set up pids limit if pids cgroup is mounted
-	if findCgroupMountpoint("pids") == nil {
+	if node.CgroupHasPid() {
 		specgen.SetLinuxResourcesPidsLimit(s.config.PidsLimit)
 	}
 
@@ -863,54 +668,74 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 
 	crioAnnotations := specgen.Config.Annotations
 
-	container, err := oci.NewContainer(containerID, containerName, containerInfo.RunDir, logPath, sb.NetNs().Path(), labels, crioAnnotations, kubeAnnotations, image, imageName, imageRef, metadata, sb.ID(), containerConfig.Tty, containerConfig.Stdin, containerConfig.StdinOnce, sb.Privileged(), sb.RuntimeHandler(), containerInfo.Dir, created, containerImageConfig.Config.StopSignal)
+	ociMetadata := &oci.Metadata{
+		Name:    metadata.Name,
+		Attempt: metadata.Attempt,
+	}
+	ociContainer, err := oci.NewContainer(containerID, containerName, containerInfo.RunDir, logPath, labels, crioAnnotations, ctr.Config().Annotations, image, imageName, imageRef, ociMetadata, sb.ID(), containerConfig.Tty, containerConfig.Stdin, containerConfig.StdinOnce, sb.RuntimeHandler(), containerInfo.Dir, created, containerImageConfig.Config.StopSignal)
 	if err != nil {
 		return nil, err
 	}
 
-	container.SetIDMappings(containerIDMappings)
-	if s.defaultIDMappings != nil && !s.defaultIDMappings.Empty() {
-		userNsPath := sb.UserNsPath()
-		if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.UserNamespace), userNsPath); err != nil {
-			return nil, err
-		}
-		for _, uidmap := range s.defaultIDMappings.UIDs() {
+	specgen.SetLinuxMountLabel(mountLabel)
+	specgen.SetProcessSelinuxLabel(processLabel)
+
+	ociContainer.SetIDMappings(containerIDMappings)
+	if containerIDMappings != nil {
+		s.finalizeUserMapping(specgen, containerIDMappings)
+
+		for _, uidmap := range containerIDMappings.UIDs() {
 			specgen.AddLinuxUIDMapping(uint32(uidmap.HostID), uint32(uidmap.ContainerID), uint32(uidmap.Size))
 		}
-		for _, gidmap := range s.defaultIDMappings.GIDs() {
+		for _, gidmap := range containerIDMappings.GIDs() {
 			specgen.AddLinuxGIDMapping(uint32(gidmap.HostID), uint32(gidmap.ContainerID), uint32(gidmap.Size))
 		}
+
+		rootPair := containerIDMappings.RootPair()
+
+		pathsToChown := []string{mountPoint, containerInfo.RunDir}
+		for _, m := range secretMounts {
+			pathsToChown = append(pathsToChown, m.Source)
+		}
+		for _, path := range pathsToChown {
+			if err := makeAccessible(path, rootPair.UID, rootPair.GID, true); err != nil {
+				return nil, errors.Wrapf(err, "cannot chown %s to %d:%d", path, rootPair.UID, rootPair.GID)
+			}
+		}
+	} else if err := specgen.RemoveLinuxNamespace(string(rspec.UserNamespace)); err != nil {
+		return nil, err
 	}
 
-	if os.Getenv("_CRIO_ROOTLESS") != "" {
-		makeOCIConfigurationRootless(&specgen)
+	if os.Getenv(rootlessEnvName) != "" {
+		makeOCIConfigurationRootless(specgen)
 	}
 
 	saveOptions := generate.ExportOptions{}
 	if err := specgen.SaveToFile(filepath.Join(containerInfo.Dir, "config.json"), saveOptions); err != nil {
 		return nil, err
 	}
+
 	if err := specgen.SaveToFile(filepath.Join(containerInfo.RunDir, "config.json"), saveOptions); err != nil {
 		return nil, err
 	}
 
-	container.SetSpec(specgen.Config)
-	container.SetMountPoint(mountPoint)
-	container.SetSeccompProfilePath(spp)
+	ociContainer.SetSpec(specgen.Config)
+	ociContainer.SetMountPoint(mountPoint)
+	ociContainer.SetSeccompProfilePath(containerConfig.Linux.SecurityContext.SeccompProfilePath)
 
 	for _, cv := range containerVolumes {
-		container.AddVolume(cv)
+		ociContainer.AddVolume(cv)
 	}
 
-	return container, nil
+	return ociContainer, nil
 }
 
 func setupWorkingDirectory(rootfs, mountLabel, containerCwd string) error {
-	fp, err := symlink.FollowSymlinkInScope(filepath.Join(rootfs, containerCwd), rootfs)
+	fp, err := securejoin.SecureJoin(rootfs, containerCwd)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(fp, 0755); err != nil {
+	if err := os.MkdirAll(fp, 0o755); err != nil {
 		return err
 	}
 	if mountLabel != "" {
@@ -944,10 +769,10 @@ func clearReadOnly(m *rspec.Mount) {
 	m.Options = append(m.Options, "rw")
 }
 
-func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *pb.ContainerConfig, specgen *generate.Generator, bindMountPrefix string) ([]oci.ContainerVolume, []rspec.Mount, error) {
+func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *types.ContainerConfig, specgen *generate.Generator, bindMountPrefix string, absentMountSourcesToReject []string) ([]oci.ContainerVolume, []rspec.Mount, error) {
 	volumes := []oci.ContainerVolume{}
 	ociMounts := []rspec.Mount{}
-	mounts := containerConfig.GetMounts()
+	mounts := containerConfig.Mounts
 
 	// Sort mounts in number of parts. This ensures that high level mounts don't
 	// shadow other mounts.
@@ -979,45 +804,55 @@ func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *p
 		specgen.AddMount(m)
 	}
 
-	for _, mount := range mounts {
-		dest := mount.GetContainerPath()
+	mountInfos, err := mount.GetMounts()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, m := range mounts {
+		dest := m.ContainerPath
 		if dest == "" {
 			return nil, nil, fmt.Errorf("mount.ContainerPath is empty")
 		}
-
-		if mount.HostPath == "" {
+		if m.HostPath == "" {
 			return nil, nil, fmt.Errorf("mount.HostPath is empty")
 		}
-		src := filepath.Join(bindMountPrefix, mount.GetHostPath())
+		if m.HostPath == "/" && dest == "/" {
+			log.Warnf(ctx, "Configuration specifies mounting host root to the container root.  This is dangerous (especially with privileged containers) and should be avoided.")
+		}
+		src := filepath.Join(bindMountPrefix, m.HostPath)
 
-		resolvedSrc, err := resolveSymbolicLink(src, bindMountPrefix)
+		resolvedSrc, err := resolveSymbolicLink(bindMountPrefix, src)
 		if err == nil {
 			src = resolvedSrc
 		} else {
 			if !os.IsNotExist(err) {
 				return nil, nil, fmt.Errorf("failed to resolve symlink %q: %v", src, err)
-			} else if err = os.MkdirAll(src, 0755); err != nil {
+			}
+			for _, toReject := range absentMountSourcesToReject {
+				if filepath.Clean(src) == toReject {
+					// special-case /etc/hostname, as we don't want it to be created as a directory
+					// This can cause issues with node reboot.
+					return nil, nil, errors.Errorf("Cannot mount %s: path does not exist and will cause issues as a directory", toReject)
+				}
+			}
+			if err = os.MkdirAll(src, 0o755); err != nil {
 				return nil, nil, fmt.Errorf("failed to mkdir %s: %s", src, err)
 			}
 		}
 
 		options := []string{"rw"}
-		if mount.Readonly {
+		if m.Readonly {
 			options = []string{"ro"}
 		}
 		options = append(options, "rbind")
 
 		// mount propagation
-		mountInfos, err := dockermounts.GetMounts(nil)
-		if err != nil {
-			return nil, nil, err
-		}
-		switch mount.GetPropagation() {
-		case pb.MountPropagation_PROPAGATION_PRIVATE:
+		switch m.Propagation {
+		case types.MountPropagationPropagationPrivate:
 			options = append(options, "rprivate")
 			// Since default root propagation in runc is rprivate ignore
 			// setting the root propagation
-		case pb.MountPropagation_PROPAGATION_BIDIRECTIONAL:
+		case types.MountPropagationPropagationBidirectional:
 			if err := ensureShared(src, mountInfos); err != nil {
 				return nil, nil, err
 			}
@@ -1025,7 +860,7 @@ func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *p
 			if err := specgen.SetLinuxRootPropagation("rshared"); err != nil {
 				return nil, nil, err
 			}
-		case pb.MountPropagation_PROPAGATION_HOST_TO_CONTAINER:
+		case types.MountPropagationPropagationHostToContainer:
 			if err := ensureSharedOrSlave(src, mountInfos); err != nil {
 				return nil, nil, err
 			}
@@ -1037,11 +872,11 @@ func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *p
 				}
 			}
 		default:
-			log.Warnf(ctx, "unknown propagation mode for hostPath %q", mount.HostPath)
+			log.Warnf(ctx, "Unknown propagation mode for hostPath %q", m.HostPath)
 			options = append(options, "rprivate")
 		}
 
-		if mount.SelinuxRelabel {
+		if m.SelinuxRelabel {
 			if err := securityLabel(src, mountLabel, false); err != nil {
 				return nil, nil, err
 			}
@@ -1050,7 +885,7 @@ func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *p
 		volumes = append(volumes, oci.ContainerVolume{
 			ContainerPath: dest,
 			HostPath:      src,
-			Readonly:      mount.Readonly,
+			Readonly:      m.Readonly,
 		})
 
 		ociMounts = append(ociMounts, rspec.Mount{
@@ -1073,44 +908,64 @@ func addOCIBindMounts(ctx context.Context, mountLabel string, containerConfig *p
 	return volumes, ociMounts, nil
 }
 
-func getDevicesFromConfig(ctx context.Context, config *libconfig.Config) ([]configDevice, error) {
-	linuxdevs := make([]configDevice, 0, len(config.RuntimeConfig.AdditionalDevices))
-
-	for _, d := range config.RuntimeConfig.AdditionalDevices {
-		src, dst, permissions, err := createconfig.ParseDevice(d)
-		if err != nil {
-			return nil, err
+// mountExists returns true if dest exists in the list of mounts
+func mountExists(specMounts []rspec.Mount, dest string) bool {
+	for _, m := range specMounts {
+		if m.Destination == dest {
+			return true
 		}
+	}
+	return false
+}
 
-		log.Debugf(ctx, "adding device src=%s dst=%s mode=%s", src, dst, permissions)
-
-		dev, err := devices.DeviceFromPath(src, permissions)
-		if err != nil {
-			return nil, errors.Wrapf(err, "%s is not a valid device", src)
+// systemd expects to have /run, /run/lock and /tmp on tmpfs
+// It also expects to be able to write to /sys/fs/cgroup/systemd and /var/log/journal
+func setupSystemd(mounts []rspec.Mount, g generate.Generator) {
+	options := []string{"rw", "rprivate", "noexec", "nosuid", "nodev"}
+	for _, dest := range []string{"/run", "/run/lock"} {
+		if mountExists(mounts, dest) {
+			continue
 		}
-
-		dev.Path = dst
-
-		linuxdevs = append(linuxdevs,
-			configDevice{
-				Device: rspec.LinuxDevice{
-					Path:     dev.Path,
-					Type:     string(dev.Type),
-					Major:    dev.Major,
-					Minor:    dev.Minor,
-					FileMode: &dev.FileMode,
-					UID:      &dev.Uid,
-					GID:      &dev.Gid,
-				},
-				Resource: rspec.LinuxDeviceCgroup{
-					Allow:  true,
-					Type:   string(dev.Type),
-					Major:  &dev.Major,
-					Minor:  &dev.Minor,
-					Access: permissions,
-				},
-			})
+		tmpfsMnt := rspec.Mount{
+			Destination: dest,
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Options:     append(options, "tmpcopyup"),
+		}
+		g.AddMount(tmpfsMnt)
+	}
+	for _, dest := range []string{"/tmp", "/var/log/journal"} {
+		if mountExists(mounts, dest) {
+			continue
+		}
+		tmpfsMnt := rspec.Mount{
+			Destination: dest,
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Options:     append(options, "tmpcopyup"),
+		}
+		g.AddMount(tmpfsMnt)
 	}
 
-	return linuxdevs, nil
+	if node.CgroupIsV2() {
+		g.RemoveMount("/sys/fs/cgroup")
+
+		systemdMnt := rspec.Mount{
+			Destination: "/sys/fs/cgroup",
+			Type:        "cgroup",
+			Source:      "cgroup",
+			Options:     []string{"private", "rw"},
+		}
+		g.AddMount(systemdMnt)
+	} else {
+		systemdMnt := rspec.Mount{
+			Destination: "/sys/fs/cgroup/systemd",
+			Type:        "bind",
+			Source:      "/sys/fs/cgroup/systemd",
+			Options:     []string{"bind", "nodev", "noexec", "nosuid"},
+		}
+		g.AddMount(systemdMnt)
+		g.AddLinuxMaskedPaths("/sys/fs/cgroup/systemd/release_agent")
+	}
+	g.AddProcessEnv("container", "crio")
 }

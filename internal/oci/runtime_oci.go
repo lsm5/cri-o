@@ -2,7 +2,6 @@ package oci
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,19 +10,24 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/cri-o/cri-o/internal/lib/config"
-	"github.com/cri-o/cri-o/internal/pkg/findprocess"
+	"github.com/containernetworking/plugins/pkg/ns"
+	conmonconfig "github.com/containers/conmon/runner/config"
+	"github.com/containers/storage/pkg/pools"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/pkg/config"
+	"github.com/cri-o/cri-o/server/cri/types"
+	"github.com/cri-o/cri-o/server/metrics"
 	"github.com/cri-o/cri-o/utils"
-	"github.com/docker/docker/pkg/pools"
 	"github.com/fsnotify/fsnotify"
+	json "github.com/json-iterator/go"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
+	"golang.org/x/sys/unix"
 	kwait "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/remotecommand"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -53,6 +57,7 @@ func newRuntimeOCI(r *Runtime, handler *config.RuntimeHandler) RuntimeImpl {
 	if handler.RuntimeRoot != "" {
 		runRoot = handler.RuntimeRoot
 	}
+
 	return &runtimeOCI{
 		Runtime: r,
 		path:    handler.RuntimePath,
@@ -66,16 +71,17 @@ type syncInfo struct {
 	Message string `json:"message,omitempty"`
 }
 
-// exitCodeInfo is used to return the monitored process exit code to the daemon
-type exitCodeInfo struct {
-	ExitCode int32  `json:"exit_code"`
-	Message  string `json:"message,omitempty"`
-}
-
 // CreateContainer creates a container.
-func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err error) {
+func (r *runtimeOCI) CreateContainer(ctx context.Context, c *Container, cgroupParent string) (retErr error) {
+	if c.Spoofed() {
+		return nil
+	}
+
 	var stderrBuf bytes.Buffer
 	parentPipe, childPipe, err := newPipe()
+	if err != nil {
+		return fmt.Errorf("error creating socket pair: %v", err)
+	}
 	childStartPipe, parentStartPipe, err := newPipe()
 	if err != nil {
 		return fmt.Errorf("error creating socket pair: %v", err)
@@ -83,26 +89,27 @@ func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err err
 	defer parentPipe.Close()
 	defer parentStartPipe.Close()
 
-	var args []string
-	if r.config.CgroupManager == SystemdCgroupsManager {
-		args = append(args, "-s")
-	}
-	if r.config.CgroupManager == CgroupfsCgroupsManager {
-		args = append(args, "--syslog")
+	args := []string{
+		"-b", c.bundlePath,
+		"-c", c.id,
+		"--exit-dir", r.config.ContainerExitsDir,
+		"-l", c.logPath,
+		"--log-level", logrus.GetLevel().String(),
+		"-n", c.name,
+		"-P", c.conmonPidFilePath(),
+		"-p", filepath.Join(c.bundlePath, "pidfile"),
+		"--persist-dir", c.dir,
+		"-r", r.path,
+		"--runtime-arg", fmt.Sprintf("%s=%s", rootFlag, r.root),
+		"--socket-dir-path", r.config.ContainerAttachSocketDir,
+		"-u", c.id,
 	}
 
-	args = append(args,
-		"-c", c.id,
-		"-n", c.name,
-		"-u", c.id,
-		"-r", r.path,
-		"-b", c.bundlePath,
-		"-p", filepath.Join(c.bundlePath, "pidfile"),
-		"-l", c.logPath,
-		"--exit-dir", r.config.ContainerExitsDir,
-		"--socket-dir-path", r.config.ContainerAttachSocketDir,
-		"--log-level", logrus.GetLevel().String(),
-		"--runtime-arg", fmt.Sprintf("%s=%s", rootFlag, r.root))
+	if r.config.CgroupManager().IsSystemd() {
+		args = append(args, "-s")
+	} else {
+		args = append(args, "--syslog")
+	}
 	if r.config.LogSizeMax >= 0 {
 		args = append(args, "--log-size-max", fmt.Sprintf("%v", r.config.LogSizeMax))
 	}
@@ -146,6 +153,7 @@ func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err err
 	err = cmd.Start()
 	if err != nil {
 		childPipe.Close()
+		childStartPipe.Close()
 		return err
 	}
 
@@ -154,7 +162,9 @@ func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err err
 	childStartPipe.Close()
 
 	// Platform specific container setup
-	r.createContainerPlatform(c, cgroupParent, cmd.Process.Pid)
+	if err := r.createContainerPlatform(c, cgroupParent, cmd.Process.Pid); err != nil {
+		return err
+	}
 
 	/* We set the cgroup, now the child can start creating children */
 	someData := []byte{0}
@@ -174,9 +184,9 @@ func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err err
 
 	// We will delete all container resources if creation fails
 	defer func() {
-		if err != nil {
-			if err := r.DeleteContainer(c); err != nil {
-				logrus.Warnf("unable to delete container %s: %v", c.ID(), err)
+		if retErr != nil {
+			if err := r.DeleteContainer(ctx, c); err != nil {
+				log.Warnf(ctx, "Unable to delete container %s: %v", c.ID(), err)
 			}
 		}
 	}()
@@ -194,141 +204,110 @@ func (r *runtimeOCI) CreateContainer(c *Container, cgroupParent string) (err err
 			return
 		}
 		ch <- syncStruct{si: si}
+		close(ch)
 	}()
 
+	var pid int
 	select {
 	case ss := <-ch:
 		if ss.err != nil {
 			return fmt.Errorf("error reading container (probably exited) json message: %v", ss.err)
 		}
-		logrus.Debugf("Received container pid: %d", ss.si.Pid)
+		log.Debugf(ctx, "Received container pid: %d", ss.si.Pid)
+		pid = ss.si.Pid
 		if ss.si.Pid == -1 {
 			if ss.si.Message != "" {
-				logrus.Errorf("Container creation error: %s", ss.si.Message)
+				log.Errorf(ctx, "Container creation error: %s", ss.si.Message)
 				return fmt.Errorf("container create failed: %s", ss.si.Message)
 			}
-			logrus.Errorf("Container creation failed")
+			log.Errorf(ctx, "Container creation failed")
 			return fmt.Errorf("container create failed")
 		}
 	case <-time.After(ContainerCreateTimeout):
-		logrus.Errorf("Container creation timeout (%v)", ContainerCreateTimeout)
+		log.Errorf(ctx, "Container creation timeout (%v)", ContainerCreateTimeout)
 		return fmt.Errorf("create container timeout")
 	}
+
+	// Now we know the container has started, save the pid to verify against future calls.
+	if err := c.state.SetInitPid(pid); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // StartContainer starts a container.
-func (r *runtimeOCI) StartContainer(c *Container) error {
+func (r *runtimeOCI) StartContainer(ctx context.Context, c *Container) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
-	if err := utils.ExecCmdWithStdStreams(os.Stdin, os.Stdout, os.Stderr,
-		r.path, rootFlag, r.root, "start", c.id); err != nil {
+	if c.Spoofed() {
+		return nil
+	}
+
+	if _, err := utils.ExecCmd(
+		r.path, rootFlag, r.root, "start", c.id,
+	); err != nil {
 		return err
 	}
 	c.state.Started = time.Now()
 	return nil
 }
 
-func prepareExec() (pidFile, parentPipe, childPipe *os.File, err error) {
-	parentPipe, childPipe, err = os.Pipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	pidFile, err = ioutil.TempFile("", "pidfile")
-	if err != nil {
-		parentPipe.Close()
-		childPipe.Close()
-		return nil, nil, nil, err
-	}
-
-	return
-}
-
-func parseLog(log []byte) (stdout, stderr []byte) {
-	// Split the log on newlines, which is what separates entries.
-	lines := bytes.SplitAfter(log, []byte{'\n'})
-	for _, line := range lines {
-		// Ignore empty lines.
-		if len(line) == 0 {
-			continue
-		}
-
-		// The format of log lines is "DATE pipe LogTag REST".
-		parts := bytes.SplitN(line, []byte{' '}, 4)
-		if len(parts) < 4 {
-			// Ignore the line if it's formatted incorrectly, but complain
-			// about it so it can be debugged.
-			logrus.Warnf("hit invalid log format: %q", string(line))
-			continue
-		}
-
-		pipe := string(parts[1])
-		content := parts[3]
-
-		linetype := string(parts[2])
-		if linetype == "P" {
-			contentLen := len(content)
-			if contentLen > 0 && content[contentLen-1] == '\n' {
-				content = content[:contentLen-1]
-			}
-		}
-
-		switch pipe {
-		case "stdout":
-			stdout = append(stdout, content...)
-		case "stderr":
-			stderr = append(stderr, content...)
-		default:
-			// Complain about unknown pipes.
-			logrus.Warnf("hit invalid log format [unknown pipe %s]: %q", pipe, string(line))
-			continue
-		}
-	}
-
-	return stdout, stderr
-}
-
 // ExecContainer prepares a streaming endpoint to execute a command in the container.
-func (r *runtimeOCI) ExecContainer(c *Container, cmd []string, stdin io.Reader, stdout, stderr io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+func (r *runtimeOCI) ExecContainer(ctx context.Context, c *Container, cmd []string, stdin io.Reader, stdout, stderr io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+	if c.Spoofed() {
+		return nil
+	}
+
 	processFile, err := prepareProcessExec(c, cmd, tty)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(processFile.Name())
+	defer os.RemoveAll(processFile)
 
-	args := []string{rootFlag, r.root, "exec"}
-	args = append(args, "--process", processFile.Name(), c.ID())
-	execCmd := exec.Command(r.path, args...) // nolint: gosec
-	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
-		execCmd.Env = append(execCmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
-	}
+	execCmd := r.constructExecCommand(ctx, c, processFile, "")
 	var cmdErr, copyError error
 	if tty {
 		cmdErr = ttyCmd(execCmd, stdin, stdout, resize)
 	} else {
+		var r, w *os.File
 		if stdin != nil {
 			// Use an os.Pipe here as it returns true *os.File objects.
 			// This way, if you run 'kubectl exec <pod> -i bash' (no tty) and type 'exit',
 			// the call below to execCmd.Run() can unblock because its Stdin is the read half
 			// of the pipe.
-			r, w, err := os.Pipe()
+			r, w, err = os.Pipe()
 			if err != nil {
 				return err
 			}
-			go func() { _, copyError = pools.Copy(w, stdin) }()
-
 			execCmd.Stdin = r
+			go func() {
+				_, copyError = pools.Copy(w, stdin)
+				w.Close()
+			}()
 		}
+
 		if stdout != nil {
 			execCmd.Stdout = stdout
 		}
+
 		if stderr != nil {
 			execCmd.Stderr = stderr
 		}
 
-		cmdErr = execCmd.Run()
+		if err := execCmd.Start(); err != nil {
+			return err
+		}
+
+		// The read side of the pipe should be closed after the container process has been started.
+		if r != nil {
+			if err := r.Close(); err != nil {
+				return err
+			}
+		}
+
+		cmdErr = execCmd.Wait()
 	}
 
 	if copyError != nil {
@@ -341,150 +320,138 @@ func (r *runtimeOCI) ExecContainer(c *Container, cmd []string, stdin io.Reader, 
 }
 
 // ExecSyncContainer execs a command in a container and returns it's stdout, stderr and return code.
-func (r *runtimeOCI) ExecSyncContainer(c *Container, command []string, timeout int64) (resp *ExecSyncResponse, err error) {
-	pidFile, parentPipe, childPipe, err := prepareExec()
-	if err != nil {
-		return nil, &ExecSyncError{
-			ExitCode: -1,
-			Err:      err,
-		}
+func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, command []string, timeout int64) (*types.ExecSyncResponse, error) {
+	if c.Spoofed() {
+		return nil, nil
 	}
-	defer parentPipe.Close()
-	defer func() {
-		if e := os.Remove(pidFile.Name()); e != nil {
-			logrus.Warnf("could not remove temporary PID file %s", pidFile.Name())
-		}
-	}()
-
-	logFile, err := ioutil.TempFile("", "crio-log-"+c.id)
-	if err != nil {
-		return nil, &ExecSyncError{
-			ExitCode: -1,
-			Err:      err,
-		}
-	}
-	logPath := logFile.Name()
-	defer func() {
-		logFile.Close()
-		os.RemoveAll(logPath)
-	}()
-
-	var args []string
-	args = append(args,
-		"-c", c.id,
-		"-n", c.name,
-		"-r", r.path,
-		"-p", pidFile.Name(),
-		"-e")
-	if c.terminal {
-		args = append(args, "-t")
-	}
-	if timeout > 0 {
-		args = append(args, "-T", fmt.Sprintf("%d", timeout))
-	}
-	args = append(args,
-		"-l", logPath,
-		"--socket-dir-path", r.config.ContainerAttachSocketDir,
-		"--log-level", logrus.GetLevel().String())
 
 	processFile, err := prepareProcessExec(c, command, c.terminal)
 	if err != nil {
-		return nil, &ExecSyncError{
-			ExitCode: -1,
-			Err:      err,
-		}
+		return nil, err
 	}
-	defer os.RemoveAll(processFile.Name())
+	defer os.RemoveAll(processFile)
 
-	args = append(args,
-		"--exec-process-spec", processFile.Name(),
-		"--runtime-arg", fmt.Sprintf("%s=%s", rootFlag, r.root))
+	pidDir, err := ioutil.TempDir("", "pidfile")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(pidDir)
 
-	cmd := exec.Command(r.config.Conmon, args...) // nolint: gosec
+	pidFile := filepath.Join(pidDir, c.id)
+
+	cmd := r.constructExecCommand(ctx, c, processFile, pidFile)
+	cmd.SysProcAttr = sysProcAttrPlatform()
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
-	cmd.ExtraFiles = append(cmd.ExtraFiles, childPipe)
-	// 0, 1 and 2 are stdin, stdout and stderr
-	cmd.Env = r.config.ConmonEnv
-	cmd.Env = append(cmd.Env, fmt.Sprintf("_OCI_SYNCPIPE=%d", 3))
-	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
-	}
 
 	err = cmd.Start()
 	if err != nil {
-		childPipe.Close()
-		return nil, &ExecSyncError{
-			Stdout:   stdoutBuf,
-			Stderr:   stderrBuf,
-			ExitCode: -1,
-			Err:      err,
-		}
+		return nil, err
 	}
 
-	// We don't need childPipe on the parent side
-	childPipe.Close()
+	// wait till the command is done
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
 
-	err = cmd.Wait()
+	if timeout > 0 {
+		select {
+		case <-time.After(time.Second * time.Duration(timeout)):
+			// Ensure the process is not left behind
+			killContainerExecProcess(ctx, pidFile, cmd)
+
+			// Make sure the runtime process has been cleaned up
+			<-done
+
+			// If the command timed out, we should return an ExecSyncResponse with a non-zero exit code because
+			// the prober code in the kubelet checks for it. If we return a custom error,
+			// then the probes transition into Unknown status and the container isn't restarted as expected.
+			return &types.ExecSyncResponse{
+				Stderr:   []byte(conmonconfig.TimedOutMessage),
+				ExitCode: -1,
+			}, nil
+		case err = <-done:
+			break
+		}
+	} else {
+		err = <-done
+	}
+
+	// gather exit code from err
+	exitCode := int32(0)
 	if err != nil {
-		return nil, &ExecSyncError{
-			Stdout:   stdoutBuf,
-			Stderr:   stderrBuf,
-			ExitCode: getExitCode(err),
-			Err:      err,
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode = int32(exitError.ExitCode())
 		}
 	}
 
-	var ec *exitCodeInfo
-	if err := json.NewDecoder(parentPipe).Decode(&ec); err != nil {
-		return nil, &ExecSyncError{
-			Stdout:   stdoutBuf,
-			Stderr:   stderrBuf,
-			ExitCode: -1,
-			Err:      err,
-		}
-	}
-
-	logrus.Debugf("Received container exit code: %v, message: %s", ec.ExitCode, ec.Message)
-
-	if ec.ExitCode == -1 {
-		return nil, &ExecSyncError{
-			Stdout:   stdoutBuf,
-			Stderr:   stderrBuf,
-			ExitCode: -1,
-			Err:      fmt.Errorf(ec.Message),
-		}
-	}
-
-	// The actual logged output is not the same as stdoutBuf and stderrBuf,
-	// which are used for getting error information. For the actual
-	// ExecSyncResponse we have to read the logfile.
-	// XXX: Currently runC dups the same console over both stdout and stderr,
-	//      so we can't differentiate between the two.
-
-	logBytes, err := ioutil.ReadFile(logPath)
-	if err != nil {
-		return nil, &ExecSyncError{
-			Stdout:   stdoutBuf,
-			Stderr:   stderrBuf,
-			ExitCode: -1,
-			Err:      err,
-		}
-	}
-
-	// We have to parse the log output into {stdout, stderr} buffers.
-	stdoutBytes, stderrBytes := parseLog(logBytes)
-	return &ExecSyncResponse{
-		Stdout:   stdoutBytes,
-		Stderr:   stderrBytes,
-		ExitCode: ec.ExitCode,
+	return &types.ExecSyncResponse{
+		Stdout:   stdoutBuf.Bytes(),
+		Stderr:   stderrBuf.Bytes(),
+		ExitCode: exitCode,
 	}, nil
 }
 
+func (r *runtimeOCI) constructExecCommand(ctx context.Context, c *Container, processFile, pidFile string) *exec.Cmd {
+	args := []string{rootFlag, r.root, "exec"}
+	if pidFile != "" {
+		args = append(args, "--pid-file", pidFile)
+	}
+	args = append(args, "--process", processFile, c.ID())
+	execCmd := exec.CommandContext(ctx, r.path, args...) // nolint: gosec
+	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
+		execCmd.Env = append(execCmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
+	}
+	return execCmd
+}
+
+func killContainerExecProcess(ctx context.Context, pidFile string, cmd *exec.Cmd) {
+	// Attempt to get the container PID and PGID from the file the runtime should have written.
+	ctrPid, ctrPgid, err := pidAndpgidFromFile(pidFile)
+	if err != nil && ctrPid <= 0 {
+		// only kill the runtime process if we failed to find a ctrPid
+		// as this means the runtime exec hasn't successfully written the pid file
+		if killErr := cmd.Process.Kill(); killErr != nil {
+			log.Errorf(ctx, "Error killing runtime exec process(%v) after error finding runtime pid: (%v)", killErr, err)
+		}
+	}
+
+	if ctrPgid > 1 {
+		// First attempt to kill the container group
+		if err := syscall.Kill(-ctrPgid, syscall.SIGKILL); err != nil {
+			log.Errorf(ctx, "Failed to kill process group after timeout: %v", err)
+		}
+	} else if ctrPid > 0 {
+		// If that fails, kill the container PID itself
+		if err := syscall.Kill(ctrPid, syscall.SIGKILL); err != nil {
+			log.Errorf(ctx, "Failed to kill process after timeout: %v", err)
+		}
+	}
+}
+
+func pidAndpgidFromFile(pidFile string) (pid, pgid int, _ error) {
+	// find the pid of the parent process
+	pidStr, err := ioutil.ReadFile(pidFile)
+	if err != nil {
+		return -1, -1, err
+	}
+	pid, err = strconv.Atoi(string(pidStr))
+	if err != nil {
+		return -1, -1, err
+	}
+	pgid, err = syscall.Getpgid(pid)
+	return pid, pgid, err
+}
+
 // UpdateContainer updates container resources
-func (r *runtimeOCI) UpdateContainer(c *Container, res *rspec.LinuxResources) error {
+func (r *runtimeOCI) UpdateContainer(ctx context.Context, c *Container, res *rspec.LinuxResources) error {
+	if c.Spoofed() {
+		return nil
+	}
+
 	cmd := exec.Command(r.path, rootFlag, r.root, "update", "--resources", "-", c.id) // nolint: gosec
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -505,7 +472,7 @@ func (r *runtimeOCI) UpdateContainer(c *Container, res *rspec.LinuxResources) er
 	return nil
 }
 
-func waitContainerStop(ctx context.Context, c *Container, timeout time.Duration, ignoreKill bool) error {
+func WaitContainerStop(ctx context.Context, c *Container, timeout time.Duration, ignoreKill bool) error {
 	done := make(chan struct{})
 	// we could potentially re-use "done" channel to exit the loop on timeout,
 	// but we use another channel "chControl" so that we never panic
@@ -518,199 +485,308 @@ func waitContainerStop(ctx context.Context, c *Container, timeout time.Duration,
 		for {
 			select {
 			case <-chControl:
+				close(done)
 				return
 			default:
-				process, err := findprocess.FindProcess(c.state.Pid)
-				if err != nil {
-					if err != findprocess.ErrNotFound {
-						logrus.Warnf("failed to find process %d for container %q: %v", c.state.Pid, c.id, err)
+				if err := c.verifyPid(); err != nil {
+					// The initial container process either doesn't exist, or isn't ours.
+					if !errors.Is(err, ErrNotFound) {
+						log.Warnf(ctx, "Failed to find process for container %s: %v", c.id, err)
 					}
 					close(done)
 					return
 				}
-				err = process.Release()
-				if err != nil {
-					logrus.Warnf("failed to release process %d for container %q: %v", c.state.Pid, c.id, err)
-				}
+				// the PID is still active and belongs to the container, continue to wait
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		close(chControl)
-		return ctx.Err()
-	case <-time.After(timeout):
-		close(chControl)
-		if ignoreKill {
-			return fmt.Errorf("failed to wait process, timeout reached after %.0f seconds",
-				timeout.Seconds())
-		}
-		err := kill(c.state.Pid)
-		if err != nil {
-			return fmt.Errorf("failed to kill process: %v", err)
+	// Operate in terms of targetTime, so that we can pause in the middle of the operation
+	// to catch a new timeout (and possibly ignore that new timeout if it's not correct to
+	// take a new one).
+	targetTime := time.Now().Add(timeout)
+	killed := false
+	for !killed {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			close(chControl)
+			return ctx.Err()
+		case <-time.After(time.Until(targetTime)):
+			close(chControl)
+			if ignoreKill {
+				return fmt.Errorf("timeout reached after %.0f seconds waiting for container process to exit",
+					timeout.Seconds())
+			}
+			pid, err := c.pid()
+			if err != nil {
+				return err
+			}
+			if err := Kill(pid); err != nil {
+				return fmt.Errorf("failed to kill process: %v", err)
+			}
+			killed = true
+		case newTimeout := <-c.stopTimeoutChan:
+			// If a new timeout comes in,
+			// interrupt the old one, and start a new one
+			newTargetTime := time.Now().Add(newTimeout)
+
+			// but only if it's earlier
+			if !newTargetTime.Before(targetTime) {
+				continue
+			}
+
+			targetTime = newTargetTime
+			timeout = newTimeout
 		}
 	}
-
 	c.state.Finished = time.Now()
+	// Successfully stopped! This is to prevent other routines from
+	// racing with this one and waiting forever.
+	// Close only the dedicated channel. If we close stopTimeoutChan,
+	// any other waiting goroutine will panic, not gracefully exit.
+	close(c.stoppedChan)
 	return nil
 }
 
 // StopContainer stops a container. Timeout is given in seconds.
-func (r *runtimeOCI) StopContainer(ctx context.Context, c *Container, timeout int64) error {
+func (r *runtimeOCI) StopContainer(ctx context.Context, c *Container, timeout int64) (retErr error) {
+	c.SetAsStopping(timeout)
+	defer func() {
+		if retErr != nil {
+			// Failed to stop, set stopping to false.
+			// Otherwise, we won't actually
+			// attempt to stop when a new request comes in,
+			// even though we're not actively stopping anymore.
+			c.SetAsNotStopping()
+		}
+	}()
+
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
-	// Check if the process is around before sending a signal
-	process, err := findprocess.FindProcess(c.state.Pid)
-	if err == findprocess.ErrNotFound {
+	if err := c.ShouldBeStopped(); err != nil {
+		return err
+	}
+
+	if c.Spoofed() {
+		c.state.Status = ContainerStateStopped
 		c.state.Finished = time.Now()
 		return nil
 	}
-	if err != nil {
-		logrus.Warnf("failed to find process %d for container %q: %v", c.state.Pid, c.id, err)
-	} else {
-		err = process.Release()
-		if err != nil {
-			logrus.Warnf("failed to release process %d for container %q: %v", c.state.Pid, c.id, err)
-		}
+
+	// The initial container process either doesn't exist, or isn't ours.
+	if err := c.verifyPid(); err != nil {
+		c.state.Finished = time.Now()
+		return nil
 	}
 
 	if timeout > 0 {
-		if err := utils.ExecCmdWithStdStreams(os.Stdin, os.Stdout, os.Stderr,
-			r.path, rootFlag, r.root, "kill", c.id, c.GetStopSignal()); err != nil {
-			if err := checkProcessGone(c); err != nil {
-				return fmt.Errorf("failed to stop container %q: %v", c.id, err)
-			}
+		if _, err := utils.ExecCmd(
+			r.path, rootFlag, r.root, "kill", c.id, c.GetStopSignal(),
+		); err != nil {
+			checkProcessGone(c)
 		}
-		err = waitContainerStop(ctx, c, time.Duration(timeout)*time.Second, true)
+		err := WaitContainerStop(ctx, c, time.Duration(timeout)*time.Second, true)
 		if err == nil {
 			return nil
 		}
-		logrus.Warnf("Stop container %q timed out: %v", c.id, err)
+		log.Warnf(ctx, "Stopping container %v with stop signal timed out: %v", c.id, err)
 	}
 
-	if err := utils.ExecCmdWithStdStreams(os.Stdin, os.Stdout, os.Stderr,
-		r.path, rootFlag, r.root, "kill", c.id, "KILL"); err != nil {
-		if err := checkProcessGone(c); err != nil {
-			return fmt.Errorf("failed to stop container %q: %v", c.id, err)
-		}
+	if _, err := utils.ExecCmd(
+		r.path, rootFlag, r.root, "kill", c.id, "KILL",
+	); err != nil {
+		checkProcessGone(c)
 	}
 
-	return waitContainerStop(ctx, c, killContainerTimeout, false)
+	return WaitContainerStop(ctx, c, killContainerTimeout, false)
 }
 
-func checkProcessGone(c *Container) error {
-	process, perr := findprocess.FindProcess(c.state.Pid)
-	if perr == findprocess.ErrNotFound {
+func checkProcessGone(c *Container) {
+	if err := c.verifyPid(); err != nil {
+		// The initial container process either doesn't exist, or isn't ours.
+		// Set state accordingly.
 		c.state.Finished = time.Now()
-		return nil
 	}
-	if perr == nil {
-		err := process.Release()
-		if err != nil {
-			logrus.Warnf("failed to release process %d for container %q: %v", c.state.Pid, c.id, err)
-		}
-	}
-	return fmt.Errorf("failed to find process: %v", perr)
 }
 
 // DeleteContainer deletes a container.
-func (r *runtimeOCI) DeleteContainer(c *Container) error {
+func (r *runtimeOCI) DeleteContainer(ctx context.Context, c *Container) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
+
+	if c.Spoofed() {
+		return nil
+	}
 
 	_, err := utils.ExecCmd(r.path, rootFlag, r.root, "delete", "--force", c.id)
 	return err
 }
 
+func updateContainerStatusFromExitFile(c *Container) error {
+	exitFilePath := c.exitFilePath()
+	fi, err := os.Stat(exitFilePath)
+	if err != nil {
+		return errors.Wrapf(err, "failed to find container exit file for %s", c.id)
+	}
+	c.state.Finished, err = getFinishedTime(fi)
+	if err != nil {
+		return errors.Wrap(err, "failed to get finished time")
+	}
+	statusCodeStr, err := ioutil.ReadFile(exitFilePath)
+	if err != nil {
+		return errors.Wrap(err, "failed to read exit file")
+	}
+	statusCode, err := strconv.Atoi(string(statusCodeStr))
+	if err != nil {
+		return errors.Wrap(err, "status code conversion failed")
+	}
+	c.state.ExitCode = utils.Int32Ptr(int32(statusCode))
+	return nil
+}
+
 // UpdateContainerStatus refreshes the status of the container.
-func (r *runtimeOCI) UpdateContainerStatus(c *Container) error {
+func (r *runtimeOCI) UpdateContainerStatus(ctx context.Context, c *Container) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
-	cmd := exec.Command(r.path, rootFlag, r.root, "state", c.id) // nolint: gosec
-	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		// there are many code paths that could lead to have a bad state in the
-		// underlying runtime.
-		// On any error like a container went away or we rebooted and containers
-		// went away we do not error out stopping kubernetes to recover.
-		// We always populate the fields below so kube can restart/reschedule
-		// containers failing.
-		c.state.Status = ContainerStateStopped
-		c.state.Finished = time.Now()
-		c.state.ExitCode = 255
+	if c.Spoofed() {
 		return nil
 	}
-	if err := json.NewDecoder(bytes.NewBuffer(out)).Decode(&c.state); err != nil {
-		return fmt.Errorf("failed to decode container status for %s: %s", c.id, err)
+
+	if c.state.ExitCode != nil && !c.state.Finished.IsZero() {
+		log.Debugf(ctx, "Skipping status update for: %+v", c.state)
+		return nil
 	}
 
-	if c.state.Status == ContainerStateStopped {
-		exitFilePath := filepath.Join(r.config.ContainerExitsDir, c.id)
-		var fi os.FileInfo
-		err = kwait.ExponentialBackoff(
-			kwait.Backoff{
-				Duration: 500 * time.Millisecond,
-				Factor:   1.2,
-				Steps:    6,
-			},
-			func() (bool, error) {
-				var err error
-				fi, err = os.Stat(exitFilePath)
-				if err != nil {
-					// wait longer
-					return false, nil
-				}
-				return true, nil
-			})
+	stateCmd := func() (*ContainerState, bool, error) {
+		cmd := exec.Command(r.path, rootFlag, r.root, "state", c.id) // nolint: gosec
+		if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
+		}
+		out, err := cmd.Output()
 		if err != nil {
-			logrus.Warnf("failed to find container exit file for %v: %v", c.id, err)
-			c.state.ExitCode = -1
-		} else {
-			c.state.Finished, err = getFinishedTime(fi)
-			if err != nil {
-				return fmt.Errorf("failed to get finished time: %v", err)
+			// there are many code paths that could lead to have a bad state in the
+			// underlying runtime.
+			// On any error like a container went away or we rebooted and containers
+			// went away we do not error out stopping kubernetes to recover.
+			// We always populate the fields below so kube can restart/reschedule
+			// containers failing.
+			if exitErr, isExitError := err.(*exec.ExitError); isExitError {
+				log.Errorf(ctx, "Failed to update container state for %s: stdout: %s, stderr: %s", c.id, string(out), string(exitErr.Stderr))
+			} else {
+				log.Errorf(ctx, "Failed to update container state for %s: %v", c.id, err)
 			}
-			statusCodeStr, err := ioutil.ReadFile(exitFilePath)
-			if err != nil {
-				return fmt.Errorf("failed to read exit file: %v", err)
+			c.state.Status = ContainerStateStopped
+			if err := updateContainerStatusFromExitFile(c); err != nil {
+				c.state.Finished = time.Now()
+				c.state.ExitCode = utils.Int32Ptr(255)
 			}
-			statusCode, err := strconv.Atoi(string(statusCodeStr))
-			if err != nil {
-				return fmt.Errorf("status code conversion failed: %v", err)
-			}
-			c.state.ExitCode = int32(statusCode)
+			return nil, true, nil
 		}
+		state := *c.state
+		if err := json.NewDecoder(bytes.NewBuffer(out)).Decode(&state); err != nil {
+			return &state, false, fmt.Errorf("failed to decode container status for %s: %s", c.id, err)
+		}
+		return &state, false, nil
+	}
+	state, canReturn, err := stateCmd()
+	if err != nil {
+		return err
+	}
+	if canReturn {
+		return nil
+	}
 
-		oomFilePath := filepath.Join(c.bundlePath, "oom")
-		if _, err = os.Stat(oomFilePath); err == nil {
-			c.state.OOMKilled = true
+	if state.Status != ContainerStateStopped {
+		*c.state = *state
+		return nil
+	}
+	// release the lock before waiting
+	c.opLock.Unlock()
+	exitFilePath := c.exitFilePath()
+	var fi os.FileInfo
+	err = kwait.ExponentialBackoff(
+		kwait.Backoff{
+			Duration: 500 * time.Millisecond,
+			Factor:   1.2,
+			Steps:    6,
+		},
+		func() (bool, error) {
+			var err error
+			fi, err = os.Stat(exitFilePath)
+			if err != nil {
+				// wait longer
+				return false, nil
+			}
+			return true, nil
+		})
+	c.opLock.Lock()
+	// run command again
+	state, _, err2 := stateCmd()
+	if err2 != nil {
+		return err2
+	}
+	if state == nil {
+		return fmt.Errorf("state command returned nil")
+	}
+	*c.state = *state
+	if err != nil {
+		log.Warnf(ctx, "Failed to find container exit file for %v: %v", c.id, err)
+	} else {
+		c.state.Finished, err = getFinishedTime(fi)
+		if err != nil {
+			return fmt.Errorf("failed to get finished time: %v", err)
 		}
+		statusCodeStr, err := ioutil.ReadFile(exitFilePath)
+		if err != nil {
+			return errors.Wrap(err, "failed to read exit file: %v")
+		}
+		statusCode, err := strconv.Atoi(string(statusCodeStr))
+		if err != nil {
+			return fmt.Errorf("status code conversion failed: %v", err)
+		}
+		c.state.ExitCode = utils.Int32Ptr(int32(statusCode))
+		log.Debugf(ctx, "Found exit code for %s: %d", c.id, statusCode)
+	}
+
+	oomFilePath := filepath.Join(c.bundlePath, "oom")
+	if _, err = os.Stat(oomFilePath); err == nil {
+		c.state.OOMKilled = true
+
+		// Collect total metric
+		metrics.Instance().MetricContainersOOMTotalInc()
+
+		// Collect metric by container name
+		metrics.Instance().MetricContainersOOMInc(c.Name())
 	}
 
 	return nil
 }
 
 // PauseContainer pauses a container.
-func (r *runtimeOCI) PauseContainer(c *Container) error {
+func (r *runtimeOCI) PauseContainer(ctx context.Context, c *Container) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
+
+	if c.Spoofed() {
+		return nil
+	}
 
 	_, err := utils.ExecCmd(r.path, rootFlag, r.root, "pause", c.id)
 	return err
 }
 
 // UnpauseContainer unpauses a container.
-func (r *runtimeOCI) UnpauseContainer(c *Container) error {
+func (r *runtimeOCI) UnpauseContainer(ctx context.Context, c *Container) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
+
+	if c.Spoofed() {
+		return nil
+	}
 
 	_, err := utils.ExecCmd(r.path, rootFlag, r.root, "resume", c.id)
 	return err
@@ -721,29 +797,37 @@ func (r *runtimeOCI) WaitContainerStateStopped(ctx context.Context, c *Container
 }
 
 // ContainerStats provides statistics of a container.
-func (r *runtimeOCI) ContainerStats(c *Container) (*ContainerStats, error) {
+func (r *runtimeOCI) ContainerStats(ctx context.Context, c *Container, cgroup string) (*ContainerStats, error) {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
-
-	return r.containerStats(c)
+	return r.containerStats(c, cgroup)
 }
 
 // SignalContainer sends a signal to a container process.
-func (r *runtimeOCI) SignalContainer(c *Container, sig syscall.Signal) error {
+func (r *runtimeOCI) SignalContainer(ctx context.Context, c *Container, sig syscall.Signal) error {
 	c.opLock.Lock()
 	defer c.opLock.Unlock()
 
-	signalString, err := findStringInSignalMap(sig)
-	if err != nil {
-		return err
+	if c.Spoofed() {
+		return nil
 	}
 
-	return utils.ExecCmdWithStdStreams(os.Stdin, os.Stdout, os.Stderr, r.path,
-		rootFlag, r.root, "kill", c.ID(), signalString)
+	if unix.SignalName(sig) == "" {
+		return errors.Errorf("unable to find signal %s", sig.String())
+	}
+
+	_, err := utils.ExecCmd(
+		r.path, rootFlag, r.root, "kill", c.ID(), strconv.Itoa(int(sig)),
+	)
+	return err
 }
 
 // AttachContainer attaches IO to a running container.
-func (r *runtimeOCI) AttachContainer(c *Container, inputStream io.Reader, outputStream, errorStream io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+func (r *runtimeOCI) AttachContainer(ctx context.Context, c *Container, inputStream io.Reader, outputStream, errorStream io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+	if c.Spoofed() {
+		return nil
+	}
+
 	controlPath := filepath.Join(c.BundlePath(), "ctl")
 	controlFile, err := os.OpenFile(controlPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -752,10 +836,10 @@ func (r *runtimeOCI) AttachContainer(c *Container, inputStream io.Reader, output
 	defer controlFile.Close()
 
 	kubecontainer.HandleResizing(resize, func(size remotecommand.TerminalSize) {
-		logrus.Debugf("Got a resize event: %+v", size)
+		log.Debugf(ctx, "Got a resize event: %+v", size)
 		_, err := fmt.Fprintf(controlFile, "%d %d %d\n", 1, size.Height, size.Width)
 		if err != nil {
-			logrus.Debugf("Failed to write to control file to resize terminal: %v", err)
+			log.Debugf(ctx, "Failed to write to control file to resize terminal: %v", err)
 		}
 	})
 
@@ -770,26 +854,39 @@ func (r *runtimeOCI) AttachContainer(c *Container, inputStream io.Reader, output
 	if outputStream != nil || errorStream != nil {
 		go func() {
 			receiveStdout <- redirectResponseToOutputStreams(outputStream, errorStream, conn)
+			close(receiveStdout)
 		}()
 	}
 
 	stdinDone := make(chan error)
 	go func() {
-		var err error
+		var err, closeErr error
 		if inputStream != nil {
 			_, err = utils.CopyDetachable(conn, inputStream, nil)
-			if closeErr := conn.CloseWrite(); closeErr != nil {
-				stdinDone <- closeErr
-			}
+			closeErr = conn.CloseWrite()
 		}
-		stdinDone <- err
+		switch {
+		case err != nil:
+			stdinDone <- err
+		case closeErr != nil:
+			stdinDone <- closeErr
+		default:
+			// neither CopyDetachable nor CloseWrite returned error
+			stdinDone <- nil
+		}
+		close(stdinDone)
 	}()
 
 	select {
 	case err := <-receiveStdout:
 		return err
 	case err := <-stdinDone:
-		if !c.StdinOnce() && !tty {
+		// This particular case is for when we get a non-tty attach
+		// with --leave-stdin-open=true. We want to return as soon
+		// as we receive EOF from the client. However, we should do
+		// this only when stdin is enabled. If there is no stdin
+		// enabled then we wait for output as usual.
+		if c.stdin && !c.StdinOnce() && !tty {
 			return nil
 		}
 		if _, ok := err.(utils.DetachError); ok {
@@ -803,67 +900,103 @@ func (r *runtimeOCI) AttachContainer(c *Container, inputStream io.Reader, output
 	return nil
 }
 
-// PortForwardContainer forwards the specified port provides statistics of a container.
-func (r *runtimeOCI) PortForwardContainer(c *Container, port int32, stream io.ReadWriter) error {
-	containerPid := c.State().Pid
-	socatPath, lookupErr := exec.LookPath("socat")
-	if lookupErr != nil {
-		return fmt.Errorf("unable to do port forwarding: socat not found")
+// PortForwardContainer forwards the specified port into the provided container.
+func (r *runtimeOCI) PortForwardContainer(ctx context.Context, c *Container, netNsPath string, port int32, stream io.ReadWriteCloser) error {
+	log.Infof(ctx,
+		"Starting port forward for %s in network namespace %s", c.ID(), netNsPath,
+	)
+
+	// Adapted reference implementation:
+	// https://github.com/containerd/cri/blob/8c366d/pkg/server/sandbox_portforward_unix.go#L65-L120
+	if err := ns.WithNetNSPath(netNsPath, func(_ ns.NetNS) error {
+		defer stream.Close()
+
+		// localhost can resolve to both IPv4 and IPv6 addresses in dual-stack systems
+		// but the application can be listening in one of the IP families only.
+		// golang has enabled RFC 6555 Fast Fallback (aka HappyEyeballs) by default in 1.12
+		// It means that if a host resolves to both IPv6 and IPv4, it will try to connect to any
+		// of those addresses and use the working connection.
+		// xref https://github.com/golang/go/commit/efc185029bf770894defe63cec2c72a4c84b2ee9
+		// However, the implementation uses go routines to start both connections in parallel,
+		// and this has limitations when running inside a namespace, so we try to the connections
+		// serially disabling the Fast Fallback support.
+		// xref https://github.com/golang/go/issues/44922
+		var d net.Dialer
+		d.FallbackDelay = -1
+		conn, err := d.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+		if err != nil {
+			return errors.Wrapf(err, "failed to connect to localhost:%d inside namespace %s", port, c.ID())
+		}
+		defer conn.Close()
+
+		errCh := make(chan error, 2)
+
+		debug := func(format string, args ...interface{}) {
+			log.Debugf(ctx, fmt.Sprintf(
+				"PortForward (id: %s, port: %d): %s", c.ID(), port, format,
+			), args...)
+		}
+
+		// Copy from the the namespace port connection to the client stream
+		go func() {
+			debug("copy data from container to client")
+			_, err := io.Copy(stream, conn)
+			errCh <- err
+		}()
+
+		// Copy from the client stream to the namespace port connection
+		go func() {
+			debug("copy data from client to container")
+			_, err := io.Copy(conn, stream)
+			errCh <- err
+		}()
+
+		// Wait until the first error is returned by one of the connections we
+		// use errFwd to store the result of the port forwarding operation if
+		// the context is cancelled close everything and return
+		var errFwd error
+		select {
+		case errFwd = <-errCh:
+			debug("stop forwarding in direction: %v", errFwd)
+		case <-ctx.Done():
+			debug("cancelled: %v", ctx.Err())
+			return ctx.Err()
+		}
+
+		// give a chance to terminate gracefully or timeout
+		const timeout = time.Second
+		select {
+		case e := <-errCh:
+			if errFwd == nil {
+				errFwd = e
+			}
+			debug("stopped forwarding in both directions")
+
+		case <-time.After(timeout):
+			debug("timed out waiting to close the connection")
+
+		case <-ctx.Done():
+			debug("cancelled: %v", ctx.Err())
+			errFwd = ctx.Err()
+		}
+
+		return errFwd
+	}); err != nil {
+		return errors.Wrapf(
+			err, "port forward into network namespace %q", netNsPath,
+		)
 	}
 
-	args := []string{"-t", fmt.Sprintf("%d", containerPid), "-n", socatPath, "-", fmt.Sprintf("TCP4:localhost:%d", port)}
-
-	nsenterPath, lookupErr := exec.LookPath("nsenter")
-	if lookupErr != nil {
-		return fmt.Errorf("unable to do port forwarding: nsenter not found")
-	}
-
-	commandString := fmt.Sprintf("%s %s", nsenterPath, strings.Join(args, " "))
-	logrus.Debugf("executing port forwarding command: %s", commandString)
-
-	command := exec.Command(nsenterPath, args...)
-	if v, found := os.LookupEnv("XDG_RUNTIME_DIR"); found {
-		command.Env = append(command.Env, fmt.Sprintf("XDG_RUNTIME_DIR=%s", v))
-	}
-	command.Stdout = stream
-
-	stderr := new(bytes.Buffer)
-	command.Stderr = stderr
-
-	// If we use Stdin, command.Run() won't return until the goroutine that's copying
-	// from stream finishes. Unfortunately, if you have a client like telnet connected
-	// via port forwarding, as long as the user's telnet client is connected to the user's
-	// local listener that port forwarding sets up, the telnet session never exits. This
-	// means that even if socat has finished running, command.Run() won't ever return
-	// (because the client still has the connection and stream open).
-	//
-	// The work around is to use StdinPipe(), as Wait() (called by Run()) closes the pipe
-	// when the command (socat) exits.
-	inPipe, err := command.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("unable to do port forwarding: error creating stdin pipe: %v", err)
-	}
-	var copyError error
-	go func() {
-		_, copyError = pools.Copy(inPipe, stream)
-		inPipe.Close()
-	}()
-
-	runErr := command.Run()
-
-	if copyError != nil {
-		return copyError
-	}
-
-	if runErr != nil {
-		return fmt.Errorf("%v: %s", runErr, stderr.String())
-	}
-
+	log.Infof(ctx, "Finished port forwarding for %q on port %d", c.ID(), port)
 	return nil
 }
 
 // ReopenContainerLog reopens the log file of a container.
-func (r *runtimeOCI) ReopenContainerLog(c *Container) error {
+func (r *runtimeOCI) ReopenContainerLog(ctx context.Context, c *Container) error {
+	if c.Spoofed() {
+		return nil
+	}
+
 	controlPath := filepath.Join(c.BundlePath(), "ctl")
 	controlFile, err := os.OpenFile(controlPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -878,40 +1011,49 @@ func (r *runtimeOCI) ReopenContainerLog(c *Container) error {
 	defer watcher.Close()
 
 	done := make(chan struct{})
+	doneClosed := false
 	errorCh := make(chan error)
 	go func() {
 		for {
 			select {
 			case event := <-watcher.Events:
-				logrus.Debugf("event: %v", event)
+				log.Debugf(ctx, "Event: %v", event)
 				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-					logrus.Debugf("file created %s", event.Name)
+					log.Debugf(ctx, "File created %s", event.Name)
 					if event.Name == c.LogPath() {
-						logrus.Debugf("expected log file created")
-						close(done)
+						log.Debugf(ctx, "Expected log file created")
+						done <- struct{}{}
 						return
 					}
 				}
 			case err := <-watcher.Errors:
 				errorCh <- fmt.Errorf("watch error for container log reopen %v: %v", c.ID(), err)
+				close(errorCh)
 				return
 			}
 		}
 	}()
 	cLogDir := filepath.Dir(c.LogPath())
 	if err := watcher.Add(cLogDir); err != nil {
-		logrus.Errorf("watcher.Add(%q) failed: %s", cLogDir, err)
+		log.Errorf(ctx, "Watcher.Add(%q) failed: %s", cLogDir, err)
 		close(done)
+		doneClosed = true
 	}
 
 	if _, err = fmt.Fprintf(controlFile, "%d %d %d\n", 2, 0, 0); err != nil {
-		logrus.Debugf("Failed to write to control file to reopen log file: %v", err)
+		log.Debugf(ctx, "Failed to write to control file to reopen log file: %v", err)
 	}
 
 	select {
 	case err := <-errorCh:
+		if !doneClosed {
+			close(done)
+		}
 		return err
 	case <-done:
+		if !doneClosed {
+			close(done)
+		}
 		break
 	}
 
@@ -919,14 +1061,23 @@ func (r *runtimeOCI) ReopenContainerLog(c *Container) error {
 }
 
 // prepareProcessExec returns the path of the process.json used in runc exec -p
-// caller is responsible to close the returned *os.File if needed.
-func prepareProcessExec(c *Container, cmd []string, tty bool) (*os.File, error) {
+// caller is responsible for removing the returned file, if prepareProcessExec succeeds
+func prepareProcessExec(c *Container, cmd []string, tty bool) (processFile string, retErr error) {
 	f, err := ioutil.TempFile("", "exec-process-")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	f.Close()
+	processFile = f.Name()
+	defer func() {
+		if retErr != nil {
+			os.RemoveAll(processFile)
+		}
+	}()
 
-	pspec := c.Spec().Process
+	// It's important to make a spec copy here to not overwrite the initial
+	// process spec
+	pspec := *c.Spec().Process
 	pspec.Args = cmd
 	// We need to default this to false else it will inherit terminal as true
 	// from the container.
@@ -936,11 +1087,15 @@ func prepareProcessExec(c *Container, cmd []string, tty bool) (*os.File, error) 
 	}
 	processJSON, err := json.Marshal(pspec)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	if err := ioutil.WriteFile(f.Name(), processJSON, 0644); err != nil {
-		return nil, err
+	if err := ioutil.WriteFile(processFile, processJSON, 0o644); err != nil {
+		return "", err
 	}
-	return f, nil
+	return processFile, nil
+}
+
+func (c *Container) conmonPidFilePath() string {
+	return filepath.Join(c.bundlePath, "conmon-pidfile")
 }

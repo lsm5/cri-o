@@ -4,16 +4,17 @@ import (
 	"context"
 	"os"
 
-	"github.com/containers/image/v4/copy"
-	"github.com/containers/image/v4/signature"
-	"github.com/containers/image/v4/storage"
-	"github.com/containers/image/v4/transports/alltransports"
-	"github.com/containers/image/v4/types"
-	"github.com/containers/libpod/pkg/rootless"
+	"github.com/containers/image/v5/copy"
+	"github.com/containers/image/v5/signature"
+	"github.com/containers/image/v5/storage"
+	"github.com/containers/image/v5/transports/alltransports"
+	"github.com/containers/image/v5/types"
+	"github.com/containers/podman/v3/pkg/rootless"
 	sstorage "github.com/containers/storage"
 	"github.com/containers/storage/pkg/reexec"
+	"github.com/cri-o/cri-o/internal/log"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 )
 
 func main() {
@@ -27,43 +28,45 @@ func main() {
 	app.Version = "0.0.1"
 
 	app.Flags = []cli.Flag{
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "debug",
 			Usage: "turn on debug logging",
 		},
-		cli.StringFlag{
-			Name:  "root, r",
-			Usage: "graph root directory",
+		&cli.StringFlag{
+			Name:    "root",
+			Aliases: []string{"r"},
+			Usage:   "graph root directory",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "runroot",
 			Usage: "run root directory",
 		},
-		cli.StringFlag{
-			Name:  "storage-driver, s",
-			Usage: "storage driver",
+		&cli.StringFlag{
+			Name:    "storage-driver",
+			Aliases: []string{"s"},
+			Usage:   "storage driver",
 		},
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "storage-opt",
 			Usage: "storage option",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "signature-policy",
 			Usage: "signature policy",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "image-name",
 			Usage: "set image name",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "add-name",
 			Usage: "name to add to image",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "import-from",
 			Usage: "import source",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "export-to",
 			Usage: "export target",
 		},
@@ -74,16 +77,16 @@ func main() {
 		var ref, importRef, exportRef types.ImageReference
 		var err error
 
-		debug := c.GlobalBool("debug")
-		rootDir := c.GlobalString("root")
-		runrootDir := c.GlobalString("runroot")
-		storageDriver := c.GlobalString("storage-driver")
-		storageOptions := c.GlobalStringSlice("storage-opt")
-		signaturePolicy := c.GlobalString("signature-policy")
-		imageName := c.GlobalString("image-name")
-		addName := c.GlobalString("add-name")
-		importFrom := c.GlobalString("import-from")
-		exportTo := c.GlobalString("export-to")
+		debug := c.Bool("debug")
+		rootDir := c.String("root")
+		runrootDir := c.String("runroot")
+		storageDriver := c.String("storage-driver")
+		storageOptions := c.StringSlice("storage-opt")
+		signaturePolicy := c.String("signature-policy")
+		imageName := c.String("image-name")
+		addName := c.String("add-name")
+		importFrom := c.String("import-from")
+		exportTo := c.String("export-to")
 
 		ctx := context.Background()
 
@@ -95,11 +98,11 @@ func main() {
 
 		if imageName != "" {
 			if rootDir == "" && runrootDir != "" {
-				logrus.Errorf("must set --root and --runroot, or neither")
+				log.Errorf(ctx, "Must set --root and --runroot, or neither")
 				os.Exit(1)
 			}
 			if rootDir != "" && runrootDir == "" {
-				logrus.Errorf("must set --root and --runroot, or neither")
+				log.Errorf(ctx, "Must set --root and --runroot, or neither")
 				os.Exit(1)
 			}
 			storeOptions, err := sstorage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
@@ -114,20 +117,20 @@ func main() {
 			}
 			store, err = sstorage.GetStore(storeOptions)
 			if err != nil {
-				logrus.Errorf("error opening storage: %v", err)
+				log.Errorf(ctx, "Error opening storage: %v", err)
 				os.Exit(1)
 			}
 			defer func() {
 				_, err = store.Shutdown(false)
 				if err != nil {
-					logrus.Warnf("unable to shutdown store: %v", err)
+					log.Warnf(ctx, "Unable to shutdown store: %v", err)
 				}
 			}()
 
 			storage.Transport.SetStore(store)
 			ref, err = storage.Transport.ParseStoreReference(store, imageName)
 			if err != nil {
-				logrus.Errorf("error parsing image name: %v", err)
+				log.Errorf(ctx, "Error parsing image name: %v", err)
 				os.Exit(1)
 			}
 		}
@@ -137,18 +140,18 @@ func main() {
 		}
 		policy, err := signature.DefaultPolicy(&systemContext)
 		if err != nil {
-			logrus.Errorf("error loading signature policy: %v", err)
+			log.Errorf(ctx, "Error loading signature policy: %v", err)
 			os.Exit(1)
 		}
 		policyContext, err := signature.NewPolicyContext(policy)
 		if err != nil {
-			logrus.Errorf("error loading signature policy: %v", err)
+			log.Errorf(ctx, "Error loading signature policy: %v", err)
 			os.Exit(1)
 		}
 		defer func() {
 			err = policyContext.Destroy()
 			if err != nil {
-				logrus.Fatalf("unable to destroy policy context: %v", err)
+				log.Fatalf(ctx, "Unable to destroy policy context: %v", err)
 			}
 		}()
 		options := &copy.Options{}
@@ -156,7 +159,7 @@ func main() {
 		if importFrom != "" {
 			importRef, err = alltransports.ParseImageName(importFrom)
 			if err != nil {
-				logrus.Errorf("error parsing image name %v: %v", importFrom, err)
+				log.Errorf(ctx, "Error parsing image name %v: %v", importFrom, err)
 				os.Exit(1)
 			}
 		}
@@ -164,7 +167,7 @@ func main() {
 		if exportTo != "" {
 			exportRef, err = alltransports.ParseImageName(exportTo)
 			if err != nil {
-				logrus.Errorf("error parsing image name %v: %v", exportTo, err)
+				log.Errorf(ctx, "Error parsing image name %v: %v", exportTo, err)
 				os.Exit(1)
 			}
 		}
@@ -173,34 +176,34 @@ func main() {
 			if importFrom != "" {
 				_, err = copy.Image(ctx, policyContext, ref, importRef, options)
 				if err != nil {
-					logrus.Errorf("error importing %s: %v", importFrom, err)
+					log.Errorf(ctx, "Error importing %s: %v", importFrom, err)
 					os.Exit(1)
 				}
 			}
 			if addName != "" {
 				destImage, err1 := storage.Transport.GetStoreImage(store, ref)
 				if err1 != nil {
-					logrus.Errorf("error finding image: %v", err1)
+					log.Errorf(ctx, "Error finding image: %v", err1)
 					os.Exit(1)
 				}
-				names := append(destImage.Names, imageName, addName)
+				names := append([]string{imageName, addName}, destImage.Names...)
 				err = store.SetNames(destImage.ID, names)
 				if err != nil {
-					logrus.Errorf("error adding name to %s: %v", imageName, err)
+					log.Errorf(ctx, "Error adding name to %s: %v", imageName, err)
 					os.Exit(1)
 				}
 			}
 			if exportTo != "" {
 				_, err = copy.Image(ctx, policyContext, exportRef, ref, options)
 				if err != nil {
-					logrus.Errorf("error exporting %s: %v", exportTo, err)
+					log.Errorf(ctx, "Error exporting %s: %v", exportTo, err)
 					os.Exit(1)
 				}
 			}
 		} else if importFrom != "" && exportTo != "" {
 			_, err = copy.Image(ctx, policyContext, exportRef, importRef, options)
 			if err != nil {
-				logrus.Errorf("error copying %s to %s: %v", importFrom, exportTo, err)
+				log.Errorf(ctx, "Error copying %s to %s: %v", importFrom, exportTo, err)
 				os.Exit(1)
 			}
 		}

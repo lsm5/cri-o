@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+# vim:set ft=bash :
+
 load helpers
 
 function setup() {
@@ -8,194 +10,162 @@ function setup() {
 
 function teardown() {
 	cleanup_test
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/*
 }
 
 @test "ensure correct hostname" {
 	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
-	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr_id="$output"
-	run crictl start "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
+	ctr_id=$(crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json)
+	crictl start "$ctr_id"
 
-	run crictl exec --sync "$ctr_id" sh -c "hostname"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "crictl_host" ]]
-	run crictl exec --sync "$ctr_id" sh -c "echo \$HOSTNAME"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "crictl_host" ]]
-	run crictl exec --sync "$ctr_id" sh -c "cat /etc/hostname"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "crictl_host" ]]
+	output=$(crictl exec --sync "$ctr_id" sh -c "hostname")
+	[[ "$output" == *"crictl_host"* ]]
+
+	output=$(crictl exec --sync "$ctr_id" sh -c "echo \$HOSTNAME")
+	[[ "$output" == *"crictl_host"* ]]
+
+	output=$(crictl exec --sync "$ctr_id" sh -c "cat /etc/hostname")
+	[[ "$output" == *"crictl_host"* ]]
 }
 
 @test "ensure correct hostname for hostnetwork:true" {
-	start_crio
-	hostnetworkconfig=$(cat "$TESTDATA"/sandbox_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["linux"]["security_context"]["namespace_options"]["network"] = 2; obj["annotations"] = {}; obj["hostname"] = ""; json.dump(obj, sys.stdout)')
-	echo "$hostnetworkconfig" > "$TESTDIR"/sandbox_hostnetwork_config.json
-	run crictl runp "$TESTDIR"/sandbox_hostnetwork_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
-	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDIR"/sandbox_hostnetwork_config.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr_id="$output"
-	run crictl start "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	if test -n "$CONTAINER_UID_MAPPINGS"; then
+		skip "userNS enabled"
+	fi
 
-	run crictl exec --sync "$ctr_id" sh -c "hostname"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "$HOSTNAME" ]]
-	run crictl exec --sync "$ctr_id" sh -c "echo \$HOSTNAME"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "$HOSTNAME" ]]
-	run crictl exec --sync "$ctr_id" sh -c "cat /etc/hostname"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	[[ "$output" =~ "$HOSTNAME" ]]
+	start_crio
+
+	jq '	  .linux.security_context.namespace_options.network = 2
+		| del(.annotations)
+		| del(.hostname)' \
+		"$TESTDATA"/sandbox_config.json > "$TESTDIR"/sandbox_hostnetwork.json
+
+	pod_id=$(crictl runp "$TESTDIR"/sandbox_hostnetwork.json)
+	ctr_id=$(crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDIR"/sandbox_hostnetwork.json)
+	crictl start "$ctr_id"
+
+	output=$(crictl exec --sync "$ctr_id" sh -c "hostname")
+	[[ "$output" == *"$HOSTNAME"* ]]
+
+	output=$(crictl exec --sync "$ctr_id" sh -c "echo \$HOSTNAME")
+	[[ "$output" == *"$HOSTNAME"* ]]
+
+	output=$(crictl exec --sync "$ctr_id" sh -c "cat /etc/hostname")
+	[[ "$output" == *"$HOSTNAME"* ]]
 }
 
 @test "Check for valid pod netns CIDR" {
 	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
+	pod_id=$(crictl runp "$TESTDATA"/sandbox_config.json)
+	ctr_id=$(crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json)
 
-	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr_id="$output"
-
-	check_pod_cidr $ctr_id
-
-}
-
-@test "Ping pod from the host" {
-	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
-
-	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr_id="$output"
-
-	ping_pod $ctr_id
-}
-
-@test "Ping pod from another pod" {
-	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod1_id="$output"
-	run crictl create "$pod1_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr1_id="$output"
-
-	temp_sandbox_conf cni_test
-
-	run crictl runp "$TESTDIR"/sandbox_config_cni_test.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod2_id="$output"
-	run crictl create "$pod2_id" "$TESTDATA"/container_redis.json "$TESTDIR"/sandbox_config_cni_test.json
-	echo "$output"
-	[ "$status" -eq 0  ]
-	ctr2_id="$output"
-
-	ping_pod_from_pod $ctr1_id $ctr2_id
-
-	ping_pod_from_pod $ctr2_id $ctr1_id
+	output=$(crictl exec --sync "$ctr_id" ip addr show dev eth0 scope global)
+	[[ "$output" = *" inet $POD_IPV4_CIDR_START"* ]]
+	[[ "$output" = *" inet6 $POD_IPV6_CIDR_START"* ]]
 }
 
 @test "Ensure correct CNI plugin namespace/name/container-id arguments" {
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf"
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	[ "$status" -eq 0 ]
+	CNI_DEFAULT_NETWORK="crio-${TESTDIR: -10}" CNI_TYPE="cni_plugin_helper.bash" start_crio
 
-	. $TESTDIR/plugin_test_args.out
+	crictl runp "$TESTDATA"/sandbox_config.json
+
+	# shellcheck disable=SC1090,SC1091
+	. "$TESTDIR"/plugin_test_args.out
 
 	[ "$FOUND_CNI_CONTAINERID" != "redhat.test.crio" ]
 	[ "$FOUND_CNI_CONTAINERID" != "podsandbox1" ]
 	[ "$FOUND_K8S_POD_NAMESPACE" = "redhat.test.crio" ]
 	[ "$FOUND_K8S_POD_NAME" = "podsandbox1" ]
+	[ "$FOUND_K8S_POD_UID" = "redhat-test-crio" ]
 }
 
 @test "Connect to pod hostport from the host" {
 	start_crio
-	run crictl runp "$TESTDATA"/sandbox_config_hostport.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	pod_id="$output"
 
-	get_host_ip
-	echo $host_ip
+	pod_config="$TESTDIR"/sandbox_config.json
+	jq '	  .port_mappings = [ {
+			protocol: 0,
+			container_port: 80,
+			host_port: 4888
+		} ]
+		| .hostname = "very.unique.name" ' \
+		"$TESTDATA"/sandbox_config.json > "$pod_config"
 
-	run crictl create "$pod_id" "$TESTDATA"/container_config_hostport.json "$TESTDATA"/sandbox_config_hostport.json
-	echo "$output"
-	[ "$status" -eq 0 ]
-	ctr_id="$output"
-	run crictl start "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
-	run nc -w 5 $host_ip 4888 </dev/null
-	echo "$output"
-	[ "$output" = "crictl_host" ]
-	[ "$status" -eq 0 ]
-	run crictl stop "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	ctr_config="$TESTDIR"/container_config.json
+	jq '	  .image.image = "quay.io/crio/busybox:latest"
+		| .command = [ "/bin/nc", "-ll", "-p", "80", "-e", "/bin/hostname" ]' \
+		"$TESTDATA"/container_config.json > "$ctr_config"
+
+	pod_id=$(crictl runp "$pod_config")
+	ctr_id=$(crictl create "$pod_id" "$ctr_config" "$pod_config")
+	crictl start "$ctr_id"
+
+	host_ip=$(get_host_ip)
+	output=$(nc -w 5 "$host_ip" 4888 < /dev/null)
+	[ "$output" = "very.unique.name" ]
+}
+
+# ensure that the server cleaned up sandbox networking
+# if the sandbox failed after network setup
+function check_networking() {
+	# shellcheck disable=SC2010
+	if ls /var/lib/cni/networks/"$CNI_DEFAULT_NETWORK" | grep -Ev '^lock|^last_reserved_ip'; then
+		echo "unexpected networks found" 1>&2
+		exit 1
+	fi
 }
 
 @test "Clean up network if pod sandbox fails" {
-	cp $(which conmon) "$TESTDIR"/conmon
+	# TODO FIXME find a way for sandbox setup to fail if manage ns is true
 	CONMON_BINARY="$TESTDIR"/conmon
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf"
+	cp "$(command -v conmon)" "$CONMON_BINARY"
+	CNI_DEFAULT_NETWORK="crio-${TESTDIR: -10}"
+	CONTAINER_MANAGE_NS_LIFECYCLE=false \
+		CONTAINER_DROP_INFRA_CTR=false \
+		start_crio
 
 	# make conmon non-executable to cause the sandbox setup to fail after
 	# networking has been configured
-	chmod 0644 $TESTDIR/conmon
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	chmod 0755 $TESTDIR/conmon
-	echo "$output"
-	[ "$status" -ne 0 ]
+	chmod 0644 "$CONMON_BINARY"
+	crictl runp "$TESTDATA"/sandbox_config.json && fail "expected runp to fail"
 
-	# ensure that the server cleaned up sandbox networking if the sandbox
-	# failed after network setup
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/last_reserved_ip*
-	num_allocated=$(ls /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING | grep -v lock | wc -l)
-	[[ "${num_allocated}" == "0" ]]
+	check_networking
 }
 
 @test "Clean up network if pod sandbox fails after plugin success" {
-	start_crio "" "" "" "" "prepare_plugin_test_args_network_conf_malformed_result"
+	CNI_DEFAULT_NETWORK="crio-${TESTDIR: -10}"
+	CNI_TYPE="cni_plugin_helper.bash" setup_crio
+	echo "DEBUG_ARGS=malformed-result" > "$TESTDIR"/cni_plugin_helper_input.env
+	start_crio_no_setup
+	check_images
 
-	run crictl runp "$TESTDATA"/sandbox_config.json
-	echo "$output"
-	[ "$status" -ne 0 ]
+	crictl runp "$TESTDATA"/sandbox_config.json && fail "expected runp to fail"
 
-	# ensure that the server cleaned up sandbox networking if the sandbox
-	# failed during network setup after the CNI plugin itself succeeded
-	rm -f /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING/last_reserved_ip*
-	num_allocated=$(ls /var/lib/cni/networks/crionet_test_args_$RANDOM_STRING | grep -v lock | wc -l)
-	[[ "${num_allocated}" == "0" ]]
+	check_networking
+}
+
+@test "Clean up network if pod sandbox gets killed" {
+	start_crio
+
+	CNI_RESULTS_DIR=/var/lib/cni/results
+	POD=$(crictl runp "$TESTDATA/sandbox_config.json")
+
+	# CNI result is there
+	# shellcheck disable=SC2010
+	[[ $(ls $CNI_RESULTS_DIR | grep "$POD") != "" ]]
+
+	# kill the sandbox
+	runtime kill "$POD" KILL
+
+	# wait for the pod to be killed
+	while crictl inspectp "$POD" | jq -e '.status.state != "SANDBOX_NOTREADY"' > /dev/null; do
+		echo Waiting for sandbox to be stopped
+	done
+
+	# now remove the sandbox
+	crictl rmp "$POD"
+
+	# CNI result is gone
+	# shellcheck disable=SC2010
+	[[ $(ls $CNI_RESULTS_DIR | grep "$POD") == "" ]]
 }

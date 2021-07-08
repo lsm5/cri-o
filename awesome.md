@@ -18,6 +18,7 @@ collects useful resources about CRI-O.
 
 ### Articles
 
+- [Under the hood of CRI-O (Oct 30, 2019)](https://vmblog.com/archive/2019/10/30/under-the-hood-of-cri-o-kubernetes-container-runtime.aspx)
 - [Demystifying Containers – Part II: Container Runtimes (Jul 15, 2019)](https://www.cncf.io/blog/2019/07/15/demystifying-containers-part-ii-container-runtimes)
 - [Red Hat contributes CRI-O to the Cloud Native Computing Foundation (Apr 8, 2019)](https://www.redhat.com/en/blog/red-hat-contributes-cri-o-cloud-native-computing-foundation)
 - [Welcome to the CNCF, CRI-O! (Apr 8, 2019)](https://www.suse.com/c/welcome-to-the-cncf-cri-o)
@@ -29,14 +30,17 @@ collects useful resources about CRI-O.
 ### Community
 
 - [Kubernetes Slack #cri-o](https://slack.com/app_redirect?channel=CAZH62UR1)
-- [Freenode IRC #cri-o](https://webchat.freenode.net)
 
 ### Podcasts
 
-- [PodCTL #12 - Introduction to CRI-O (Oct 30, 2017)](https://podctl.com/an-introduction-to-cri-o)
+- [PodCTL #12 - Introduction to CRI-O (Oct 30, 2017)](https://podctl.buzzsprout.com/110399/585611-an-introduction-to-cri-o)
 
 ### Videos
 
+- [CRI-O: Deep Diving into the Security (Aug 19, 2020)](https://youtu.be/RoiIx8mcECY)
+- [CRI-O: Development Process & How to Contribute (Aug 18, 2020)](https://youtu.be/0MB5tUT4u3Q)
+- [CRI-O: Under the Hood (Nov 20, 2019)](https://www.youtube.com/watch?v=3kz-pERV6Qg)
+- [Introduction to CRI-O (Nov 19, 2019)](https://www.youtube.com/watch?v=V53nSS2mnsM)
 - [CRI-O: All the Runtime Kubernetes Needs (Dec 15, 2017)](https://www.youtube.com/watch?v=NVa8xR4Eyj8)
 
 ### Tutorials
